@@ -106,48 +106,103 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         debug!("Finding symbols");
-        let mut out = vec![];
+        let mut symbols = vec![];
+
         if let Some(doc) = self.doc_map.get(params.text_document.uri.as_str()) {
-            for node in doc.nodes.values() {
+            let mut all_nodes: Vec<_> = doc.nodes.iter().collect();
+            all_nodes.sort_by_key(|(_, node)| node.range.start.line);
+
+            let mut stack: Vec<DocumentSymbol> = vec![];
+
+            for (_, node) in all_nodes {
                 match &node.node_type {
                     ast::NodeType::Heading(level) => {
-                        let heading_text = doc.contents.lines().nth(node.range.start.line as usize)
+                        let heading_text = doc
+                            .contents
+                            .lines()
+                            .nth(node.range.start.line as usize)
                             .unwrap_or("")
                             .trim_start_matches('#')
                             .trim();
-                        
-                        out.push(SymbolInformation {
+
+                        let heading_symbol = DocumentSymbol {
                             name: heading_text.to_string(),
-                            kind: SymbolKind::FUNCTION,
+                            detail: None,
+                            kind: SymbolKind::NAMESPACE,
                             tags: None,
                             deprecated: None,
-                            location: Location {
-                                uri: params.text_document.uri.clone(),
-                                range: node.range,
-                            },
-                            container_name: None,
-                        });
+                            range: node.range,
+                            selection_range: node.range,
+                            children: None,
+                        };
+
+                        while let Some(top) = stack.last() {
+                            if top.kind == SymbolKind::NAMESPACE {
+                                let top_level = doc
+                                    .contents
+                                    .lines()
+                                    .find(|line| line.trim_start_matches('#').trim() == top.name)
+                                    .map(|line| line.chars().take_while(|&c| c == '#').count())
+                                    .unwrap_or(1);
+
+                                if top_level >= *level {
+                                    let popped = stack.pop().unwrap();
+                                    if let Some(parent) = stack.last_mut() {
+                                        if parent.children.is_none() {
+                                            parent.children = Some(vec![]);
+                                        }
+                                        parent.children.as_mut().unwrap().push(popped);
+                                    } else {
+                                        symbols.push(popped);
+                                    }
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+
+                        stack.push(heading_symbol);
                     }
-                    ast::NodeType::Paragraph => {}
                     ast::NodeType::Link(link) => {
-                        out.push(SymbolInformation {
+                        let link_symbol = DocumentSymbol {
                             name: link.address.clone(),
+                            detail: None,
                             kind: SymbolKind::FIELD,
                             tags: None,
                             deprecated: None,
-                            location: Location {
-                                uri: params.text_document.uri.clone(),
-                                range: node.range,
-                            },
-                            container_name: None,
-                        });
+                            range: node.range,
+                            selection_range: node.range,
+                            children: None,
+                        };
+                        if let Some(current_heading) = stack.last_mut() {
+                            if current_heading.children.is_none() {
+                                current_heading.children = Some(vec![]);
+                            }
+                            current_heading.children.as_mut().unwrap().push(link_symbol);
+                        } else {
+                            symbols.push(link_symbol);
+                        }
                     }
+                    _ => {} // Skip paragraphs
+                }
+            }
+
+            // Pop remaining headings from stack
+            while let Some(heading) = stack.pop() {
+                if let Some(parent) = stack.last_mut() {
+                    if parent.children.is_none() {
+                        parent.children = Some(vec![]);
+                    }
+                    parent.children.as_mut().unwrap().push(heading);
+                } else {
+                    symbols.push(heading);
                 }
             }
         }
 
-        out.sort_by_key(|symbol| symbol.location.range.start.line);
-        Ok(Some(DocumentSymbolResponse::Flat(out)))
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
     async fn goto_declaration(

@@ -10,7 +10,7 @@
     - [ ] Links
     - [ ] Tags
     - [ ] Properties
-- [ ] Document symbols (an outline)
+- [x] Document symbols
 - [ ] Hover?
 - [ ] Code actions?
     - [ ] Align table
