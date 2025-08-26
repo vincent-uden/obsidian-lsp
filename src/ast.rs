@@ -1,22 +1,23 @@
+use regex::Regex;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
-pub struct Node<'a> {
-    node_type: NodeType<'a>,
-    children: Vec<NodeId>,
+pub struct Node {
+    pub node_type: NodeType,
+    pub children: Vec<NodeId>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum NodeType<'a> {
+#[derive(Debug, Clone)]
+pub enum NodeType {
     Heading(usize),
     Paragraph,
-    Link(Link<'a>),
+    Link(Link),
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Link<'a> {
-    link_type: LinkType,
-    address: &'a str,
+#[derive(Debug, Clone)]
+pub struct Link {
+    pub link_type: LinkType,
+    pub address: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -29,16 +30,91 @@ pub enum LinkType {
 type NodeId = (usize, usize);
 
 #[derive(Debug, Clone)]
-pub struct Document<'a> {
-    contents: String,
-    nodes: HashMap<NodeId, Node<'a>>,
+pub struct Document {
+    pub contents: String,
+    pub nodes: HashMap<NodeId, Node>,
 }
 
-impl<'a> Into<Document<'a>> for String {
-    fn into(self) -> Document<'a> {
+impl Document {
+    fn extract_wiki_links(&mut self) {
+        let wiki_regex = Regex::new(r"\[\[([^\]]+)\]\]").unwrap();
+        let lines: Vec<&str> = self.contents.lines().collect();
+        let mut additional_nodes = HashMap::new();
+
+        let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+
+        for &node_id in &node_ids {
+            let (line_num, _) = node_id;
+
+            if let Some(node) = self.nodes.get(&node_id) {
+                match node.node_type {
+                    NodeType::Heading(_) => {
+                        if let Some(line) = lines.get(line_num) {
+                            for mat in wiki_regex.find_iter(line) {
+                                let link_text = &line[mat.start() + 2..mat.end() - 2];
+                                let link_node_id = (line_num, mat.start());
+
+                                additional_nodes.insert(
+                                    link_node_id,
+                                    Node {
+                                        node_type: NodeType::Link(Link {
+                                            link_type: LinkType::Wiki,
+                                            address: link_text.to_string(),
+                                        }),
+                                        children: vec![],
+                                    },
+                                );
+
+                                if let Some(parent_node) = self.nodes.get_mut(&node_id) {
+                                    parent_node.children.push(link_node_id);
+                                }
+                            }
+                        }
+                    }
+                    NodeType::Paragraph => {
+                        let mut current_line = line_num;
+                        while current_line < lines.len()
+                            && !lines[current_line].is_empty()
+                            && !lines[current_line].trim_start().starts_with('#')
+                        {
+                            if let Some(line) = lines.get(current_line) {
+                                for mat in wiki_regex.find_iter(line) {
+                                    let link_text = &line[mat.start() + 2..mat.end() - 2];
+                                    let link_node_id = (current_line, mat.start());
+
+                                    additional_nodes.insert(
+                                        link_node_id,
+                                        Node {
+                                            node_type: NodeType::Link(Link {
+                                                link_type: LinkType::Wiki,
+                                                address: link_text.to_string(),
+                                            }),
+                                            children: vec![],
+                                        },
+                                    );
+
+                                    if let Some(parent_node) = self.nodes.get_mut(&node_id) {
+                                        parent_node.children.push(link_node_id);
+                                    }
+                                }
+                            }
+                            current_line += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        self.nodes.extend(additional_nodes);
+    }
+}
+
+impl From<String> for Document {
+    fn from(value: String) -> Self {
         let mut nodes = HashMap::new();
         let mut node_stack: Vec<NodeId> = vec![];
-        let lines: Vec<&str> = self.lines().collect();
+        let lines: Vec<&str> = value.lines().collect();
         let mut i = 0;
 
         while i < lines.len() {
@@ -126,10 +202,13 @@ impl<'a> Into<Document<'a>> for String {
             }
         }
 
-        Document {
-            contents: self,
+        let mut document = Document {
+            contents: value,
             nodes,
-        }
+        };
+
+        document.extract_wiki_links();
+        document
     }
 }
 
@@ -203,5 +282,79 @@ mod tests {
             "Subheading should have 2 paragraph children, it has {}",
             doc.nodes[&(6, 0)].children.len()
         );
+    }
+
+    #[test]
+    fn parse_wiki_links() {
+        let src = include_str!("../assets/tests/wikilinks.md");
+        let doc: Document = src.to_string().into();
+
+        // Should have 2 headings + 3 paragraphs + 6 wiki links = 11 nodes total
+        assert!(
+            doc.nodes.len() == 11,
+            "Expected 11 nodes (2 headings + 3 paragraphs + 6 wiki links), got {}",
+            doc.nodes.len()
+        );
+
+        // Check heading with wiki link
+        let heading_node = &doc.nodes[&(0, 0)];
+        assert!(matches!(heading_node.node_type, NodeType::Heading(1)));
+        assert!(
+            heading_node.children.len() >= 2,
+            "Heading should have paragraph + wiki link as children, got {}",
+            heading_node.children.len()
+        );
+
+        // Find the wiki link in the heading
+        let wiki_link_in_heading = heading_node
+            .children
+            .iter()
+            .find(|&&child_id| matches!(doc.nodes[&child_id].node_type, NodeType::Link(_)));
+        assert!(
+            wiki_link_in_heading.is_some(),
+            "Should find wiki link in heading"
+        );
+
+        // Check the wiki link content
+        if let Some(&link_id) = wiki_link_in_heading {
+            if let NodeType::Link(link) = &doc.nodes[&link_id].node_type {
+                assert_eq!(link.address, "Wiki Link");
+                assert!(matches!(link.link_type, LinkType::Wiki));
+            }
+        }
+
+        // Check paragraph with multiple wiki links
+        let paragraph_node = &doc.nodes[&(2, 0)];
+        assert!(matches!(paragraph_node.node_type, NodeType::Paragraph));
+
+        let wiki_links_in_paragraph: Vec<_> = paragraph_node
+            .children
+            .iter()
+            .filter(|&&child_id| matches!(doc.nodes[&child_id].node_type, NodeType::Link(_)))
+            .collect();
+        assert_eq!(
+            wiki_links_in_paragraph.len(),
+            2,
+            "First paragraph should have 2 wiki links, got {}",
+            wiki_links_in_paragraph.len()
+        );
+
+        // Verify all wiki links have correct content
+        let all_links: Vec<_> = doc
+            .nodes
+            .values()
+            .filter_map(|node| match &node.node_type {
+                NodeType::Link(link) => Some(&link.address),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(all_links.len(), 6, "Should have 6 wiki links total");
+        assert!(all_links.contains(&&"Wiki Link".to_string()));
+        assert!(all_links.contains(&&"another link".to_string()));
+        assert!(all_links.contains(&&"second link".to_string()));
+        assert!(all_links.contains(&&"link in second line".to_string()));
+        assert!(all_links.contains(&&"nested link".to_string()));
+        assert!(all_links.contains(&&"final link".to_string()));
     }
 }

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 dashmap = "6.1.0"
+regex = "1.11.1"
 tokio = { version = "1.47.1", features = ["full"] }
 tower-lsp-server = "0.22.1"
 tracing = "0.1.41"

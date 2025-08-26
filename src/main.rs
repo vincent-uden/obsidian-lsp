@@ -7,13 +7,15 @@ use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::{Level, debug, info};
 
+use crate::ast::Document;
+
 mod ast;
 
 #[derive(Debug)]
 struct Backend {
     client: Client,
     //               Uri     Contents
-    doc_map: DashMap<String, String>,
+    doc_map: DashMap<String, Document>,
 }
 
 impl LanguageServer for Backend {
@@ -31,6 +33,7 @@ impl LanguageServer for Backend {
                     },
                 )),
                 definition_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -98,6 +101,46 @@ impl LanguageServer for Backend {
         Ok(Some(GotoDefinitionResponse::Array(Vec::new())))
     }
 
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        debug!("Finding symbols");
+        let mut out = vec![];
+        if let Some(doc) = self.doc_map.get(params.text_document.uri.as_str()) {
+            for node in doc.nodes.values() {
+                match &node.node_type {
+                    ast::NodeType::Heading(level) => {}
+                    ast::NodeType::Paragraph => {}
+                    ast::NodeType::Link(link) => {
+                        out.push(SymbolInformation {
+                            name: link.address.clone(),
+                            kind: SymbolKind::FIELD,
+                            tags: None,
+                            deprecated: None,
+                            location: Location {
+                                uri: params.text_document.uri.clone(),
+                                range: Range {
+                                    start: Position {
+                                        line: 0,
+                                        character: 0,
+                                    },
+                                    end: Position {
+                                        line: 0,
+                                        character: 0,
+                                    },
+                                },
+                            },
+                            container_name: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(Some(DocumentSymbolResponse::Flat(out)))
+    }
+
     async fn goto_declaration(
         &self,
         params: request::GotoDeclarationParams,
@@ -110,8 +153,8 @@ impl LanguageServer for Backend {
 impl Backend {
     async fn on_change(&self, params: TextDocumentItem) {
         debug!("On change: {params:?}");
-        self.doc_map.insert(params.uri.to_string(), params.text);
-        // TODO: Parsing and stuff
+        self.doc_map
+            .insert(params.uri.to_string(), Document::from(params.text));
     }
 }
 
