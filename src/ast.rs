@@ -1,3 +1,4 @@
+use lsp_types::{Position, Range};
 use regex::Regex;
 use std::collections::HashMap;
 
@@ -5,6 +6,7 @@ use std::collections::HashMap;
 pub struct Node {
     pub node_type: NodeType,
     pub children: Vec<NodeId>,
+    pub range: Range,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,17 @@ impl Document {
                                 let link_text = &line[mat.start() + 2..mat.end() - 2];
                                 let link_node_id = (line_num, mat.start());
 
+                                let range = Range {
+                                    start: Position {
+                                        line: line_num as u32,
+                                        character: mat.start() as u32,
+                                    },
+                                    end: Position {
+                                        line: line_num as u32,
+                                        character: mat.end() as u32,
+                                    },
+                                };
+
                                 additional_nodes.insert(
                                     link_node_id,
                                     Node {
@@ -62,6 +75,7 @@ impl Document {
                                             address: link_text.to_string(),
                                         }),
                                         children: vec![],
+                                        range,
                                     },
                                 );
 
@@ -82,6 +96,17 @@ impl Document {
                                     let link_text = &line[mat.start() + 2..mat.end() - 2];
                                     let link_node_id = (current_line, mat.start());
 
+                                    let range = Range {
+                                        start: Position {
+                                            line: current_line as u32,
+                                            character: mat.start() as u32,
+                                        },
+                                        end: Position {
+                                            line: current_line as u32,
+                                            character: mat.end() as u32,
+                                        },
+                                    };
+
                                     additional_nodes.insert(
                                         link_node_id,
                                         Node {
@@ -90,6 +115,7 @@ impl Document {
                                                 address: link_text.to_string(),
                                             }),
                                             children: vec![],
+                                            range,
                                         },
                                     );
 
@@ -133,11 +159,24 @@ impl From<String> for Document {
                     "#" | "##" | "###" | "####" | "#####" | "######" => {
                         let level = word.len();
                         let current_node_id = (i, col);
+
+                        let range = Range {
+                            start: Position {
+                                line: i as u32,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: i as u32,
+                                character: line.len() as u32,
+                            },
+                        };
+
                         nodes.insert(
                             current_node_id,
                             Node {
                                 node_type: NodeType::Heading(level),
                                 children: vec![],
+                                range,
                             },
                         );
                         while let Some(&parent_id) = node_stack.last() {
@@ -171,6 +210,7 @@ impl From<String> for Document {
                     _ => {
                         let paragraph_start = i;
                         let current_node_id = (paragraph_start, col);
+                        let start_line = i;
 
                         while i < lines.len()
                             && !lines[i].is_empty()
@@ -179,11 +219,30 @@ impl From<String> for Document {
                             i += 1;
                         }
 
+                        let end_line = if i > 0 { i - 1 } else { 0 };
+                        let end_char = if let Some(last_line) = lines.get(end_line) {
+                            last_line.len() as u32
+                        } else {
+                            0
+                        };
+
+                        let range = Range {
+                            start: Position {
+                                line: start_line as u32,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: end_line as u32,
+                                character: end_char,
+                            },
+                        };
+
                         nodes.insert(
                             current_node_id,
                             Node {
                                 node_type: NodeType::Paragraph,
                                 children: vec![],
+                                range,
                             },
                         );
 

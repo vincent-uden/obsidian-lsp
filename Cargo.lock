@@ -303,6 +303,7 @@ name = "obsidian-lsp"
 version = "0.1.0"
 dependencies = [
  "dashmap",
+ "lsp-types",
  "regex",
  "tokio",
  "tower-lsp-server",

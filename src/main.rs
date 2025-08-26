@@ -110,7 +110,24 @@ impl LanguageServer for Backend {
         if let Some(doc) = self.doc_map.get(params.text_document.uri.as_str()) {
             for node in doc.nodes.values() {
                 match &node.node_type {
-                    ast::NodeType::Heading(level) => {}
+                    ast::NodeType::Heading(level) => {
+                        let heading_text = doc.contents.lines().nth(node.range.start.line as usize)
+                            .unwrap_or("")
+                            .trim_start_matches('#')
+                            .trim();
+                        
+                        out.push(SymbolInformation {
+                            name: heading_text.to_string(),
+                            kind: SymbolKind::FUNCTION,
+                            tags: None,
+                            deprecated: None,
+                            location: Location {
+                                uri: params.text_document.uri.clone(),
+                                range: node.range,
+                            },
+                            container_name: None,
+                        });
+                    }
                     ast::NodeType::Paragraph => {}
                     ast::NodeType::Link(link) => {
                         out.push(SymbolInformation {
@@ -120,16 +137,7 @@ impl LanguageServer for Backend {
                             deprecated: None,
                             location: Location {
                                 uri: params.text_document.uri.clone(),
-                                range: Range {
-                                    start: Position {
-                                        line: 0,
-                                        character: 0,
-                                    },
-                                    end: Position {
-                                        line: 0,
-                                        character: 0,
-                                    },
-                                },
+                                range: node.range,
                             },
                             container_name: None,
                         });
@@ -138,6 +146,7 @@ impl LanguageServer for Backend {
             }
         }
 
+        out.sort_by_key(|symbol| symbol.location.range.start.line);
         Ok(Some(DocumentSymbolResponse::Flat(out)))
     }
 
