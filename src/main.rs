@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::File;
 
 use dashmap::DashMap;
@@ -7,6 +6,8 @@ use tower_lsp_server::lsp_types::request::GotoDeclarationResponse;
 use tower_lsp_server::lsp_types::*;
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::{Level, debug, info};
+
+mod ast;
 
 #[derive(Debug)]
 struct Backend {
