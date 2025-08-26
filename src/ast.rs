@@ -38,14 +38,21 @@ impl<'a> Into<Document<'a>> for String {
     fn into(self) -> Document<'a> {
         let mut nodes = HashMap::new();
         let mut node_stack: Vec<NodeId> = vec![];
-        for (i, line) in self.lines().enumerate() {
+        let lines: Vec<&str> = self.lines().collect();
+        let mut i = 0;
+
+        while i < lines.len() {
+            let line = lines[i];
+
             if line.is_empty() {
+                i += 1;
                 continue;
             }
 
-            let mut col = 0;
+            let col = 0;
             let mut words = line.split_whitespace();
             match words.next() {
+                // Headings
                 Some(word) => match word {
                     "#" | "##" | "###" | "####" | "#####" | "######" => {
                         let level = word.len();
@@ -82,13 +89,39 @@ impl<'a> Into<Document<'a>> for String {
                         }
 
                         node_stack.push(current_node_id);
-                        col += level;
+                        i += 1;
                     }
-                    _ => {}
+                    // Paragraphs
+                    _ => {
+                        let paragraph_start = i;
+                        let current_node_id = (paragraph_start, col);
+
+                        while i < lines.len()
+                            && !lines[i].is_empty()
+                            && !lines[i].trim_start().starts_with('#')
+                        {
+                            i += 1;
+                        }
+
+                        nodes.insert(
+                            current_node_id,
+                            Node {
+                                node_type: NodeType::Paragraph,
+                                children: vec![],
+                            },
+                        );
+
+                        if let Some(&parent_id) = node_stack.last() {
+                            nodes
+                                .get_mut(&parent_id)
+                                .unwrap()
+                                .children
+                                .push(current_node_id);
+                        }
+                    }
                 },
                 None => {
-                    // Empty lines cant contain any nodes
-                    continue;
+                    i += 1;
                 }
             }
         }
@@ -131,6 +164,44 @@ mod tests {
             doc.nodes[&(4, 0)].children.len() == 1,
             "H2 Heading 2 should have 1 child (H3), it has {}",
             doc.nodes[&(4, 0)].children.len()
+        );
+    }
+
+    #[test]
+    fn parse_paragraphs() {
+        let src = include_str!("../assets/tests/paragraphs.md");
+        let doc: Document = src.to_string().into();
+
+        // Should have 3 headings + 5 paragraphs = 8 nodes total
+        assert!(
+            doc.nodes.len() == 8,
+            "Expected 8 nodes, got {}",
+            doc.nodes.len()
+        );
+
+        // # Main Heading should have 3 children (2 paragraphs + 1 subheading)
+        assert!(matches!(
+            &doc.nodes[&(0, 0)].node_type,
+            NodeType::Heading(1)
+        ));
+        assert!(
+            doc.nodes[&(0, 0)].children.len() == 3,
+            "Main Heading should have 3 children, it has {}",
+            doc.nodes[&(0, 0)].children.len()
+        );
+
+        // First paragraph under Main Heading
+        assert!(matches!(&doc.nodes[&(2, 0)].node_type, NodeType::Paragraph));
+
+        // ## Subheading should have 2 children (2 paragraphs)
+        assert!(matches!(
+            &doc.nodes[&(6, 0)].node_type,
+            NodeType::Heading(2)
+        ));
+        assert!(
+            doc.nodes[&(6, 0)].children.len() == 2,
+            "Subheading should have 2 paragraph children, it has {}",
+            doc.nodes[&(6, 0)].children.len()
         );
     }
 }
