@@ -49,31 +49,39 @@ impl<'a> Into<Document<'a>> for String {
                 Some(word) => match word {
                     "#" | "##" | "###" | "####" | "#####" | "######" => {
                         let level = word.len();
+                        let current_node_id = (i, col);
                         nodes.insert(
-                            (i, col),
+                            current_node_id,
                             Node {
                                 node_type: NodeType::Heading(level),
                                 children: vec![],
                             },
                         );
-                        if let Some(id) = node_stack.last() {
-                            let outer_node = nodes.get_mut(id).unwrap();
-                            if match outer_node.node_type {
-                                NodeType::Heading(prev_level) => prev_level >= level,
-                                NodeType::Paragraph => true,
-                                NodeType::Link(_) => true,
-                            } {
-                                // TODO: The stack should be popped, not cleared, and this needs to
-                                // be in a loop since it might require us to pop multiple headings
-                                node_stack.clear();
-                                node_stack.push((i, col));
+                        while let Some(&parent_id) = node_stack.last() {
+                            if let Some(parent_node) = nodes.get(&parent_id) {
+                                match parent_node.node_type {
+                                    NodeType::Heading(parent_level) => {
+                                        if parent_level < level {
+                                            nodes
+                                                .get_mut(&parent_id)
+                                                .unwrap()
+                                                .children
+                                                .push(current_node_id);
+                                            break;
+                                        } else {
+                                            node_stack.pop();
+                                        }
+                                    }
+                                    _ => {
+                                        node_stack.pop();
+                                    }
+                                }
                             } else {
-                                node_stack.push((i, col));
-                                outer_node.children.push((i, col));
+                                node_stack.pop();
                             }
-                        } else {
-                            node_stack.push((i, col));
                         }
+
+                        node_stack.push(current_node_id);
                         col += level;
                     }
                     _ => {}
@@ -109,9 +117,20 @@ mod tests {
             NodeType::Heading(1)
         ));
         assert!(
-            doc.nodes[&(0, 0)].children.len() == 3,
-            "H1 Heading 1 should have 3 children, it has {}",
+            doc.nodes[&(0, 0)].children.len() == 2,
+            "H1 Heading 1 should have 2 direct children (H2s), it has {}",
             doc.nodes[&(0, 0)].children.len()
+        );
+
+        // ## H2 Heading 2 should have 1 child (H3)
+        assert!(matches!(
+            &doc.nodes[&(4, 0)].node_type,
+            NodeType::Heading(2)
+        ));
+        assert!(
+            doc.nodes[&(4, 0)].children.len() == 1,
+            "H2 Heading 2 should have 1 child (H3), it has {}",
+            doc.nodes[&(4, 0)].children.len()
         );
     }
 }
