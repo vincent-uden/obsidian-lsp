@@ -233,8 +233,8 @@ impl LanguageServer for Backend {
                     }
                     ast::NodeType::Link(link) => {
                         let link_symbol = DocumentSymbol {
-                            name: link.address.clone(),
-                            detail: None,
+                            name: link.display_text.clone(),
+                            detail: Some(format!("→ {}", link.address)),
                             kind: SymbolKind::FIELD,
                             tags: None,
                             deprecated: None,
@@ -367,6 +367,28 @@ mod tests {
         
         // Different line
         assert!(!position_in_range(Position { line: 2, character: 10 }, range));
+    }
+
+    #[test]
+    fn test_pipe_link_integration() {
+        // Test that pipe links are parsed correctly and use address for resolution
+        let doc_content = "This has a [[target-file|Custom Display]] link.";
+        let doc = ast::Document::from(doc_content.to_string());
+
+        // Find the link node
+        let link_node = doc.nodes.values()
+            .find(|node| matches!(node.node_type, ast::NodeType::Link(_)))
+            .expect("Should find a link node");
+
+        if let ast::NodeType::Link(link) = &link_node.node_type {
+            assert_eq!(link.address, "target-file", "Address should be the part before the pipe");
+            assert_eq!(link.display_text, "Custom Display", "Display text should be the part after the pipe");
+            
+            // The goto_definition logic should use link.address for file resolution
+            println!("✓ Pipe link parsed correctly: address='{}', display='{}'", link.address, link.display_text);
+        } else {
+            panic!("Expected Link node type");
+        }
     }
 }
 

@@ -19,7 +19,8 @@ pub enum NodeType {
 #[derive(Debug, Clone)]
 pub struct Link {
     pub link_type: LinkType,
-    pub address: String,
+    pub address: String,      // The actual link target (before the pipe)
+    pub display_text: String, // The display text (after the pipe, or same as address if no pipe)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +36,16 @@ type NodeId = (usize, usize);
 pub struct Document {
     pub contents: String,
     pub nodes: HashMap<NodeId, Node>,
+}
+
+fn parse_wiki_link_text(link_text: &str) -> (String, String) {
+    if let Some(pipe_pos) = link_text.find('|') {
+        let address = link_text[..pipe_pos].trim().to_string();
+        let display_text = link_text[pipe_pos + 1..].trim().to_string();
+        (address, display_text)
+    } else {
+        (link_text.trim().to_string(), link_text.trim().to_string())
+    }
 }
 
 impl Document {
@@ -54,6 +65,7 @@ impl Document {
                         if let Some(line) = lines.get(line_num) {
                             for mat in wiki_regex.find_iter(line) {
                                 let link_text = &line[mat.start() + 2..mat.end() - 2];
+                                let (address, display_text) = parse_wiki_link_text(link_text);
                                 let link_node_id = (line_num, mat.start());
 
                                 let range = Range {
@@ -72,7 +84,8 @@ impl Document {
                                     Node {
                                         node_type: NodeType::Link(Link {
                                             link_type: LinkType::Wiki,
-                                            address: link_text.to_string(),
+                                            address,
+                                            display_text,
                                         }),
                                         children: vec![],
                                         range,
@@ -94,6 +107,7 @@ impl Document {
                             if let Some(line) = lines.get(current_line) {
                                 for mat in wiki_regex.find_iter(line) {
                                     let link_text = &line[mat.start() + 2..mat.end() - 2];
+                                    let (address, display_text) = parse_wiki_link_text(link_text);
                                     let link_node_id = (current_line, mat.start());
 
                                     let range = Range {
@@ -112,7 +126,8 @@ impl Document {
                                         Node {
                                             node_type: NodeType::Link(Link {
                                                 link_type: LinkType::Wiki,
-                                                address: link_text.to_string(),
+                                                address,
+                                                display_text,
                                             }),
                                             children: vec![],
                                             range,
@@ -415,5 +430,72 @@ mod tests {
         assert!(all_links.contains(&&"link in second line".to_string()));
         assert!(all_links.contains(&&"nested link".to_string()));
         assert!(all_links.contains(&&"final link".to_string()));
+    }
+
+    #[test]
+    fn parse_pipe_links() {
+        let src = include_str!("../assets/tests/pipe-links.md");
+        let doc: Document = src.to_string().into();
+
+
+
+        // Should have 1 heading + 3 paragraphs + 3 wiki links = 7 nodes total
+        assert_eq!(doc.nodes.len(), 7, "Expected 7 nodes, got {}", doc.nodes.len());
+
+        // Get all link nodes
+        let links: Vec<_> = doc.nodes.values()
+            .filter_map(|node| match &node.node_type {
+                NodeType::Link(link) => Some(link),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(links.len(), 3, "Expected 3 links, got {}", links.len());
+
+        // Check pipe link with custom display text
+        let pipe_link = links.iter()
+            .find(|link| link.address == "target-file")
+            .expect("Should find target-file link");
+        assert_eq!(pipe_link.display_text, "Custom Display Text");
+
+        // Check simple link without pipe
+        let simple_link = links.iter()
+            .find(|link| link.address == "simple-link")
+            .expect("Should find simple-link");
+        assert_eq!(simple_link.display_text, "simple-link");
+
+        // Check complex path with pipe
+        let complex_link = links.iter()
+            .find(|link| link.address == "complex/path")
+            .expect("Should find complex/path link");
+        assert_eq!(complex_link.display_text, "Simplified Name");
+    }
+
+    #[test]
+    fn test_parse_wiki_link_text() {
+        // Test link without pipe
+        let (address, display) = parse_wiki_link_text("simple-link");
+        assert_eq!(address, "simple-link");
+        assert_eq!(display, "simple-link");
+
+        // Test link with pipe
+        let (address, display) = parse_wiki_link_text("target-file|Custom Display");
+        assert_eq!(address, "target-file");
+        assert_eq!(display, "Custom Display");
+
+        // Test link with pipe and whitespace
+        let (address, display) = parse_wiki_link_text("  folder/file  |  Nice Name  ");
+        assert_eq!(address, "folder/file");
+        assert_eq!(display, "Nice Name");
+
+        // Test edge case: pipe at end
+        let (address, display) = parse_wiki_link_text("file-name|");
+        assert_eq!(address, "file-name");
+        assert_eq!(display, "");
+
+        // Test edge case: pipe at start
+        let (address, display) = parse_wiki_link_text("|Display Only");
+        assert_eq!(address, "");
+        assert_eq!(display, "Display Only");
     }
 }
