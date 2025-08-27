@@ -8,14 +8,17 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::{Level, debug, info};
 
 use crate::ast::Document;
+use crate::index::VaultIndex;
 
 mod ast;
+mod index;
 
 #[derive(Debug)]
 struct Backend {
     client: Client,
     //               Uri     Contents
     doc_map: DashMap<String, Document>,
+    vault_index: Option<VaultIndex>,
 }
 
 impl LanguageServer for Backend {
@@ -238,6 +241,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         doc_map: DashMap::new(),
+        vault_index: None,
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
