@@ -1,9 +1,10 @@
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use tokio::sync::RwLock;
+use tokio::fs;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::lsp_types::request::GotoDeclarationResponse;
 use tower_lsp_server::lsp_types::*;
@@ -40,6 +41,7 @@ impl LanguageServer for Backend {
                 )),
                 definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -63,9 +65,11 @@ impl LanguageServer for Backend {
                         if let Some(path) = folder.uri.to_file_path() {
                             Backend::index_workspace_static(&client, &vault_index, &path).await;
                             break; // Use the first workspace folder
-                        }
-                    }
-                }
+        }
+    }
+
+
+}
             }
         });
     }
@@ -278,6 +282,93 @@ impl LanguageServer for Backend {
         debug!("{params:?}");
         Ok(Some(GotoDeclarationResponse::Array(Vec::new())))
     }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        
+        debug!("Hover requested for {:?} at {:?}", uri, position);
+        
+        // Get the document
+        let doc = match self.doc_map.get(uri.as_str()) {
+            Some(doc) => doc,
+            None => {
+                debug!("Document not found for hover: {:?}", uri);
+                return Ok(None);
+            }
+        };
+        
+        // Find the node at the cursor position
+        let node = match self.find_node_at_position(&doc, position) {
+            Some(node) => node,
+            None => {
+                debug!("No node found at hover position {:?}", position);
+                return Ok(None);
+            }
+        };
+        
+        // Check if it's a link node
+        if let NodeType::Link(link) = &node.node_type {
+            debug!("Found link for hover: {}", link.address);
+            
+            // Get the vault index
+            let vault_index = self.vault_index.read().await;
+            let index = match vault_index.as_ref() {
+                Some(index) => index,
+                None => {
+                    debug!("Vault index not available for hover");
+                    return Ok(None);
+                }
+            };
+            
+            // Find the target file
+            if let Some(target_path) = index.find_file(&link.address) {
+                debug!("Found target file for hover: {}", target_path.display());
+                
+                // Read and preview the file content
+                if let Ok(preview_content) = self.create_file_preview(&target_path).await {
+                    let file_name = target_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Unknown");
+                    
+                    let hover_text = format!(
+                        "**{}** *({})*\n\n{}",
+                        link.display_text,
+                        file_name,
+                        preview_content
+                    );
+                    
+                    let hover_content = MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: hover_text,
+                    };
+                    
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(hover_content),
+                        range: Some(node.range),
+                    }));
+                }
+            } else {
+                debug!("Target file not found for hover link: {}", link.address);
+                
+                // Show "file not found" message
+                let hover_content = MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: format!("**File not found**: `{}`", link.address),
+                };
+                
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(hover_content),
+                    range: Some(node.range),
+                }));
+            }
+        } else {
+            debug!("Node at hover position is not a link: {:?}", node.node_type);
+        }
+        
+        Ok(None)
+    }
 }
 
 impl Backend {
@@ -320,6 +411,77 @@ impl Backend {
             }
         }
         None
+    }
+
+    async fn create_file_preview(&self, file_path: &PathBuf) -> std::result::Result<String, std::io::Error> {
+        let content = fs::read_to_string(file_path).await?;
+        
+        // Extract preview content based on file type
+        let preview = if file_path.extension().and_then(|s| s.to_str()) == Some("md") {
+            self.extract_markdown_preview(&content)
+        } else {
+            self.extract_generic_preview(&content)
+        };
+        
+        Ok(preview)
+    }
+
+    fn extract_markdown_preview(&self, content: &str) -> String {
+        const PREVIEW_LINES: usize = 15;
+        const MAX_CHARS: usize = 800;
+        
+        let lines: Vec<&str> = content.lines().collect();
+        let mut preview_lines = Vec::new();
+        let mut char_count = 0;
+        let mut skipped_frontmatter = false;
+        
+        for line in lines.iter().take(PREVIEW_LINES + 10) { // Extra buffer for frontmatter
+            // Skip YAML frontmatter
+            if !skipped_frontmatter {
+                if line.trim() == "---" {
+                    if preview_lines.is_empty() {
+                        // Start of frontmatter, skip it
+                        continue;
+                    } else {
+                        // End of frontmatter
+                        skipped_frontmatter = true;
+                        continue;
+                    }
+                }
+                if !preview_lines.is_empty() || !line.trim().is_empty() {
+                    // We're either past frontmatter or found non-empty content
+                    skipped_frontmatter = true;
+                } else {
+                    continue; // Skip empty lines before content
+                }
+            }
+            
+            if preview_lines.len() >= PREVIEW_LINES || char_count + line.len() > MAX_CHARS {
+                break;
+            }
+            
+            preview_lines.push(*line);
+            char_count += line.len() + 1; // +1 for newline
+        }
+        
+        let preview = preview_lines.join("\n");
+        
+        // Add truncation indicator if needed
+        if lines.len() > preview_lines.len() + 10 || char_count >= MAX_CHARS {
+            format!("{}\n\n---\n*Preview truncated • [Click to open file]*", preview.trim())
+        } else {
+            preview
+        }
+    }
+
+    fn extract_generic_preview(&self, content: &str) -> String {
+        const MAX_CHARS: usize = 300;
+        
+        if content.len() <= MAX_CHARS {
+            format!("```\n{}\n```", content)
+        } else {
+            format!("```\n{}\n...\n```\n\n*[Preview truncated...]*", &content[..MAX_CHARS])
+        }
     }
 }
 
