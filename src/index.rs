@@ -116,7 +116,7 @@ fn parse_aliases_from_frontmatter(frontmatter: &str) -> Vec<String> {
     aliases
 }
 
-pub async fn index_vault(root: &Path) -> Result<VaultIndex, Box<dyn std::error::Error>> {
+pub async fn index_vault(root: &Path) -> Result<VaultIndex, String> {
     let mut index = VaultIndex::new();
     let start = Instant::now();
     

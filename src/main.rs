@@ -1,14 +1,17 @@
 use std::fs::File;
+use std::path::Path;
+use std::sync::Arc;
 
 use dashmap::DashMap;
+use tokio::sync::RwLock;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::lsp_types::request::GotoDeclarationResponse;
 use tower_lsp_server::lsp_types::*;
-use tower_lsp_server::{Client, LanguageServer, LspService, Server};
-use tracing::{Level, debug, info};
+use tower_lsp_server::{Client, LanguageServer, LspService, Server, UriExt};
+use tracing::{Level, debug, info, warn};
 
-use crate::ast::Document;
-use crate::index::VaultIndex;
+use crate::ast::{Document, Node, NodeType};
+use crate::index::{VaultIndex, index_vault};
 
 mod ast;
 mod index;
@@ -18,7 +21,7 @@ struct Backend {
     client: Client,
     //               Uri     Contents
     doc_map: DashMap<String, Document>,
-    vault_index: Option<VaultIndex>,
+    vault_index: Arc<RwLock<Option<VaultIndex>>>,
 }
 
 impl LanguageServer for Backend {
@@ -43,11 +46,28 @@ impl LanguageServer for Backend {
         })
     }
 
-    async fn initialized(&self, _: InitializedParams) {
-        info!("Server initalized");
+    async fn initialized(&self, _params: InitializedParams) {
+        info!("Server initialized");
         self.client
-            .log_message(MessageType::ERROR, "server initialized!")
+            .log_message(MessageType::INFO, "Obsidian LSP server initialized!")
             .await;
+        
+        // Index workspace in a separate task to avoid Send issues
+        let client = self.client.clone();
+        let vault_index = self.vault_index.clone();
+        
+        tokio::spawn(async move {
+            if let Ok(workspace_folders) = client.workspace_folders().await {
+                if let Some(folders) = workspace_folders {
+                    for folder in folders {
+                        if let Some(path) = folder.uri.to_file_path() {
+                            Backend::index_workspace_static(&client, &vault_index, &path).await;
+                            break; // Use the first workspace folder
+                        }
+                    }
+                }
+            }
+        });
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -84,24 +104,67 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        debug!(
-            "{:?} {:?}",
-            params.text_document_position_params.text_document.uri,
-            params.text_document_position_params.position
-        );
-        if let Some(contents) = self.doc_map.get(
-            params
-                .text_document_position_params
-                .text_document
-                .uri
-                .as_str(),
-        ) {
-            debug!(
-                "{:?} {:?}",
-                params.text_document_position_params.position, *contents
-            );
+        let uri = &params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        
+        debug!("Goto definition requested for {:?} at {:?}", uri, position);
+        
+        // Get the document
+        let doc = match self.doc_map.get(uri.as_str()) {
+            Some(doc) => doc,
+            None => {
+                debug!("Document not found: {:?}", uri);
+                return Ok(None);
+            }
+        };
+        
+        // Find the node at the cursor position
+        let node = match self.find_node_at_position(&doc, position) {
+            Some(node) => node,
+            None => {
+                debug!("No node found at position {:?}", position);
+                return Ok(None);
+            }
+        };
+        
+        // Check if it's a link node
+        if let NodeType::Link(link) = &node.node_type {
+            debug!("Found link: {}", link.address);
+            
+            // Get the vault index
+            let vault_index = self.vault_index.read().await;
+            let index = match vault_index.as_ref() {
+                Some(index) => index,
+                None => {
+                    debug!("Vault index not available");
+                    return Ok(None);
+                }
+            };
+            
+            // Find the target file
+            if let Some(target_path) = index.find_file(&link.address) {
+                debug!("Found target file: {}", target_path.display());
+                
+                // Convert path to URI
+                if let Some(target_uri) = Uri::from_file_path(&target_path) {
+                    let location = Location {
+                        uri: target_uri,
+                        range: Range {
+                            start: Position { line: 0, character: 0 },
+                            end: Position { line: 0, character: 0 },
+                        },
+                    };
+                    
+                    return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                }
+            } else {
+                debug!("Target file not found for link: {}", link.address);
+            }
+        } else {
+            debug!("Node at position is not a link: {:?}", node.node_type);
         }
-        Ok(Some(GotoDefinitionResponse::Array(Vec::new())))
+        
+        Ok(None)
     }
 
     async fn document_symbol(
@@ -223,6 +286,88 @@ impl Backend {
         self.doc_map
             .insert(params.uri.to_string(), Document::from(params.text));
     }
+
+    async fn index_workspace_static(
+        client: &Client, 
+        vault_index: &Arc<RwLock<Option<VaultIndex>>>, 
+        root: &Path
+    ) {
+        info!("Indexing workspace at: {}", root.display());
+        match index_vault(root).await {
+            Ok(index) => {
+                let file_count = index.files.len();
+                info!("Successfully indexed {} files", file_count);
+                let mut vault_index_guard = vault_index.write().await;
+                *vault_index_guard = Some(index);
+                client
+                    .log_message(MessageType::INFO, &format!("Indexed {} files", file_count))
+                    .await;
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to index workspace: {}", e);
+                warn!("{}", error_msg);
+                client
+                    .log_message(MessageType::ERROR, &error_msg)
+                    .await;
+            }
+        }
+    }
+
+    fn find_node_at_position<'a>(&self, doc: &'a Document, position: Position) -> Option<&'a Node> {
+        for node in doc.nodes.values() {
+            if position_in_range(position, node.range) {
+                return Some(node);
+            }
+        }
+        None
+    }
+}
+
+fn position_in_range(position: Position, range: Range) -> bool {
+    if position.line < range.start.line || position.line > range.end.line {
+        return false;
+    }
+    
+    if position.line == range.start.line && position.character < range.start.character {
+        return false;
+    }
+    
+    if position.line == range.end.line && position.character > range.end.character {
+        return false;
+    }
+    
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_position_in_range() {
+        let range = Range {
+            start: Position { line: 1, character: 5 },
+            end: Position { line: 1, character: 15 },
+        };
+
+        // Inside range
+        assert!(position_in_range(Position { line: 1, character: 10 }, range));
+        
+        // At start boundary
+        assert!(position_in_range(Position { line: 1, character: 5 }, range));
+        
+        // At end boundary
+        assert!(position_in_range(Position { line: 1, character: 15 }, range));
+        
+        // Before range
+        assert!(!position_in_range(Position { line: 1, character: 4 }, range));
+        
+        // After range
+        assert!(!position_in_range(Position { line: 1, character: 16 }, range));
+        
+        // Different line
+        assert!(!position_in_range(Position { line: 2, character: 10 }, range));
+    }
 }
 
 #[tokio::main]
@@ -241,7 +386,7 @@ async fn main() {
     let (service, socket) = LspService::new(|client| Backend {
         client,
         doc_map: DashMap::new(),
-        vault_index: None,
+        vault_index: Arc::new(RwLock::new(None)),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
