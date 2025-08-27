@@ -433,17 +433,64 @@ mod tests {
     }
 
     #[test]
+    fn test_exclamation_links_debug() {
+        let content = r#"# Test Document
+
+This has an exclamation link:
+
+![[voith_charge_and_discharge_no_sensor.svg|center]]
+
+End of document."#;
+
+        println!("Testing document content:\n{}", content);
+        let doc: Document = content.to_string().into();
+
+        println!("Parsed document has {} nodes", doc.nodes.len());
+
+        // Print all nodes
+        for (id, node) in &doc.nodes {
+            println!("Node {:?}: {:?}", id, node.node_type);
+        }
+
+        // Look for link nodes specifically
+        let link_nodes: Vec<_> = doc
+            .nodes
+            .values()
+            .filter_map(|node| match &node.node_type {
+                NodeType::Link(link) => Some(link),
+                _ => None,
+            })
+            .collect();
+
+        println!("Found {} link nodes", link_nodes.len());
+        for link in &link_nodes {
+            println!(
+                "  Link: address='{}', display='{}'",
+                link.address, link.display_text
+            );
+        }
+
+        // This should find the exclamation link
+        assert!(!link_nodes.is_empty(), "Should find the exclamation link");
+    }
+
+    #[test]
     fn parse_pipe_links() {
         let src = include_str!("../assets/tests/pipe-links.md");
         let doc: Document = src.to_string().into();
 
-
-
         // Should have 1 heading + 3 paragraphs + 3 wiki links = 7 nodes total
-        assert_eq!(doc.nodes.len(), 7, "Expected 7 nodes, got {}", doc.nodes.len());
+        assert_eq!(
+            doc.nodes.len(),
+            7,
+            "Expected 7 nodes, got {}",
+            doc.nodes.len()
+        );
 
         // Get all link nodes
-        let links: Vec<_> = doc.nodes.values()
+        let links: Vec<_> = doc
+            .nodes
+            .values()
             .filter_map(|node| match &node.node_type {
                 NodeType::Link(link) => Some(link),
                 _ => None,
@@ -453,19 +500,22 @@ mod tests {
         assert_eq!(links.len(), 3, "Expected 3 links, got {}", links.len());
 
         // Check pipe link with custom display text
-        let pipe_link = links.iter()
+        let pipe_link = links
+            .iter()
             .find(|link| link.address == "target-file")
             .expect("Should find target-file link");
         assert_eq!(pipe_link.display_text, "Custom Display Text");
 
         // Check simple link without pipe
-        let simple_link = links.iter()
+        let simple_link = links
+            .iter()
             .find(|link| link.address == "simple-link")
             .expect("Should find simple-link");
         assert_eq!(simple_link.display_text, "simple-link");
 
         // Check complex path with pipe
-        let complex_link = links.iter()
+        let complex_link = links
+            .iter()
             .find(|link| link.address == "complex/path")
             .expect("Should find complex/path link");
         assert_eq!(complex_link.display_text, "Simplified Name");

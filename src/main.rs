@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tokio::sync::RwLock;
 use tokio::fs;
+use tokio::sync::RwLock;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::lsp_types::request::GotoDeclarationResponse;
 use tower_lsp_server::lsp_types::*;
@@ -53,11 +53,11 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "Obsidian LSP server initialized!")
             .await;
-        
+
         // Index workspace in a separate task to avoid Send issues
         let client = self.client.clone();
         let vault_index = self.vault_index.clone();
-        
+
         tokio::spawn(async move {
             if let Ok(workspace_folders) = client.workspace_folders().await {
                 if let Some(folders) = workspace_folders {
@@ -65,11 +65,9 @@ impl LanguageServer for Backend {
                         if let Some(path) = folder.uri.to_file_path() {
                             Backend::index_workspace_static(&client, &vault_index, &path).await;
                             break; // Use the first workspace folder
-        }
-    }
-
-
-}
+                        }
+                    }
+                }
             }
         });
     }
@@ -110,9 +108,9 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        
+
         debug!("Goto definition requested for {:?} at {:?}", uri, position);
-        
+
         // Get the document
         let doc = match self.doc_map.get(uri.as_str()) {
             Some(doc) => doc,
@@ -121,7 +119,7 @@ impl LanguageServer for Backend {
                 return Ok(None);
             }
         };
-        
+
         // Find the node at the cursor position
         let node = match self.find_node_at_position(&doc, position) {
             Some(node) => node,
@@ -130,11 +128,11 @@ impl LanguageServer for Backend {
                 return Ok(None);
             }
         };
-        
+
         // Check if it's a link node
         if let NodeType::Link(link) = &node.node_type {
             debug!("Found link: {}", link.address);
-            
+
             // Get the vault index
             let vault_index = self.vault_index.read().await;
             let index = match vault_index.as_ref() {
@@ -144,21 +142,27 @@ impl LanguageServer for Backend {
                     return Ok(None);
                 }
             };
-            
+
             // Find the target file
             if let Some(target_path) = index.find_file(&link.address) {
                 debug!("Found target file: {}", target_path.display());
-                
+
                 // Convert path to URI
                 if let Some(target_uri) = Uri::from_file_path(&target_path) {
                     let location = Location {
                         uri: target_uri,
                         range: Range {
-                            start: Position { line: 0, character: 0 },
-                            end: Position { line: 0, character: 0 },
+                            start: Position {
+                                line: 0,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: 0,
+                                character: 0,
+                            },
                         },
                     };
-                    
+
                     return Ok(Some(GotoDefinitionResponse::Scalar(location)));
                 }
             } else {
@@ -167,7 +171,7 @@ impl LanguageServer for Backend {
         } else {
             debug!("Node at position is not a link: {:?}", node.node_type);
         }
-        
+
         Ok(None)
     }
 
@@ -286,9 +290,9 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        
+
         debug!("Hover requested for {:?} at {:?}", uri, position);
-        
+
         // Get the document
         let doc = match self.doc_map.get(uri.as_str()) {
             Some(doc) => doc,
@@ -297,7 +301,7 @@ impl LanguageServer for Backend {
                 return Ok(None);
             }
         };
-        
+
         // Find the node at the cursor position
         let node = match self.find_node_at_position(&doc, position) {
             Some(node) => node,
@@ -306,11 +310,11 @@ impl LanguageServer for Backend {
                 return Ok(None);
             }
         };
-        
+
         // Check if it's a link node
         if let NodeType::Link(link) = &node.node_type {
             debug!("Found link for hover: {}", link.address);
-            
+
             // Get the vault index
             let vault_index = self.vault_index.read().await;
             let index = match vault_index.as_ref() {
@@ -320,30 +324,28 @@ impl LanguageServer for Backend {
                     return Ok(None);
                 }
             };
-            
+
             // Find the target file
             if let Some(target_path) = index.find_file(&link.address) {
                 debug!("Found target file for hover: {}", target_path.display());
-                
+
                 // Read and preview the file content
                 if let Ok(preview_content) = self.create_file_preview(&target_path).await {
                     let file_name = target_path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("Unknown");
-                    
+
                     let hover_text = format!(
                         "**{}** *({})*\n\n{}",
-                        link.display_text,
-                        file_name,
-                        preview_content
+                        link.display_text, file_name, preview_content
                     );
-                    
+
                     let hover_content = MarkupContent {
                         kind: MarkupKind::Markdown,
                         value: hover_text,
                     };
-                    
+
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(hover_content),
                         range: Some(node.range),
@@ -351,13 +353,13 @@ impl LanguageServer for Backend {
                 }
             } else {
                 debug!("Target file not found for hover link: {}", link.address);
-                
+
                 // Show "file not found" message
                 let hover_content = MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: format!("**File not found**: `{}`", link.address),
                 };
-                
+
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(hover_content),
                     range: Some(node.range),
@@ -366,7 +368,7 @@ impl LanguageServer for Backend {
         } else {
             debug!("Node at hover position is not a link: {:?}", node.node_type);
         }
-        
+
         Ok(None)
     }
 }
@@ -379,9 +381,9 @@ impl Backend {
     }
 
     async fn index_workspace_static(
-        client: &Client, 
-        vault_index: &Arc<RwLock<Option<VaultIndex>>>, 
-        root: &Path
+        client: &Client,
+        vault_index: &Arc<RwLock<Option<VaultIndex>>>,
+        root: &Path,
     ) {
         info!("Indexing workspace at: {}", root.display());
         match index_vault(root).await {
@@ -397,45 +399,59 @@ impl Backend {
             Err(e) => {
                 let error_msg = format!("Failed to index workspace: {}", e);
                 warn!("{}", error_msg);
-                client
-                    .log_message(MessageType::ERROR, &error_msg)
-                    .await;
+                client.log_message(MessageType::ERROR, &error_msg).await;
             }
         }
     }
 
     fn find_node_at_position<'a>(&self, doc: &'a Document, position: Position) -> Option<&'a Node> {
+        let mut matching_nodes = Vec::new();
+
+        // Find all nodes that contain the position
         for node in doc.nodes.values() {
             if position_in_range(position, node.range) {
+                matching_nodes.push(node);
+            }
+        }
+
+        // Prioritize link nodes over other types
+        for node in &matching_nodes {
+            if matches!(node.node_type, NodeType::Link(_)) {
                 return Some(node);
             }
         }
-        None
+
+        // If no link node found, return the first match (could be paragraph/heading)
+        matching_nodes.first().copied()
     }
 
-    async fn create_file_preview(&self, file_path: &PathBuf) -> std::result::Result<String, std::io::Error> {
+    async fn create_file_preview(
+        &self,
+        file_path: &PathBuf,
+    ) -> std::result::Result<String, std::io::Error> {
         let content = fs::read_to_string(file_path).await?;
-        
+
         // Extract preview content based on file type
         let preview = if file_path.extension().and_then(|s| s.to_str()) == Some("md") {
             self.extract_markdown_preview(&content)
         } else {
             self.extract_generic_preview(&content)
         };
-        
+
         Ok(preview)
     }
 
     fn extract_markdown_preview(&self, content: &str) -> String {
         const PREVIEW_LINES: usize = 15;
         const MAX_CHARS: usize = 800;
-        
+
         let lines: Vec<&str> = content.lines().collect();
         let mut preview_lines = Vec::new();
         let mut char_count = 0;
         let mut skipped_frontmatter = false;
-        
-        for line in lines.iter().take(PREVIEW_LINES + 10) { // Extra buffer for frontmatter
+
+        for line in lines.iter().take(PREVIEW_LINES + 10) {
+            // Extra buffer for frontmatter
             // Skip YAML frontmatter
             if !skipped_frontmatter {
                 if line.trim() == "---" {
@@ -455,20 +471,23 @@ impl Backend {
                     continue; // Skip empty lines before content
                 }
             }
-            
+
             if preview_lines.len() >= PREVIEW_LINES || char_count + line.len() > MAX_CHARS {
                 break;
             }
-            
+
             preview_lines.push(*line);
             char_count += line.len() + 1; // +1 for newline
         }
-        
+
         let preview = preview_lines.join("\n");
-        
+
         // Add truncation indicator if needed
         if lines.len() > preview_lines.len() + 10 || char_count >= MAX_CHARS {
-            format!("{}\n\n---\n*Preview truncated • [Click to open file]*", preview.trim())
+            format!(
+                "{}\n\n---\n*Preview truncated • [Click to open file]*",
+                preview.trim()
+            )
         } else {
             preview
         }
@@ -476,11 +495,14 @@ impl Backend {
 
     fn extract_generic_preview(&self, content: &str) -> String {
         const MAX_CHARS: usize = 300;
-        
+
         if content.len() <= MAX_CHARS {
             format!("```\n{}\n```", content)
         } else {
-            format!("```\n{}\n...\n```\n\n*[Preview truncated...]*", &content[..MAX_CHARS])
+            format!(
+                "```\n{}\n...\n```\n\n*[Preview truncated...]*",
+                &content[..MAX_CHARS]
+            )
         }
     }
 }
@@ -489,15 +511,15 @@ fn position_in_range(position: Position, range: Range) -> bool {
     if position.line < range.start.line || position.line > range.end.line {
         return false;
     }
-    
+
     if position.line == range.start.line && position.character < range.start.character {
         return false;
     }
-    
+
     if position.line == range.end.line && position.character > range.end.character {
         return false;
     }
-    
+
     true
 }
 
@@ -508,27 +530,69 @@ mod tests {
     #[test]
     fn test_position_in_range() {
         let range = Range {
-            start: Position { line: 1, character: 5 },
-            end: Position { line: 1, character: 15 },
+            start: Position {
+                line: 1,
+                character: 5,
+            },
+            end: Position {
+                line: 1,
+                character: 15,
+            },
         };
 
         // Inside range
-        assert!(position_in_range(Position { line: 1, character: 10 }, range));
-        
+        assert!(position_in_range(
+            Position {
+                line: 1,
+                character: 10
+            },
+            range
+        ));
+
         // At start boundary
-        assert!(position_in_range(Position { line: 1, character: 5 }, range));
-        
+        assert!(position_in_range(
+            Position {
+                line: 1,
+                character: 5
+            },
+            range
+        ));
+
         // At end boundary
-        assert!(position_in_range(Position { line: 1, character: 15 }, range));
-        
+        assert!(position_in_range(
+            Position {
+                line: 1,
+                character: 15
+            },
+            range
+        ));
+
         // Before range
-        assert!(!position_in_range(Position { line: 1, character: 4 }, range));
-        
+        assert!(!position_in_range(
+            Position {
+                line: 1,
+                character: 4
+            },
+            range
+        ));
+
         // After range
-        assert!(!position_in_range(Position { line: 1, character: 16 }, range));
-        
+        assert!(!position_in_range(
+            Position {
+                line: 1,
+                character: 16
+            },
+            range
+        ));
+
         // Different line
-        assert!(!position_in_range(Position { line: 2, character: 10 }, range));
+        assert!(!position_in_range(
+            Position {
+                line: 2,
+                character: 10
+            },
+            range
+        ));
     }
 
     #[test]
@@ -538,16 +602,27 @@ mod tests {
         let doc = ast::Document::from(doc_content.to_string());
 
         // Find the link node
-        let link_node = doc.nodes.values()
+        let link_node = doc
+            .nodes
+            .values()
             .find(|node| matches!(node.node_type, ast::NodeType::Link(_)))
             .expect("Should find a link node");
 
         if let ast::NodeType::Link(link) = &link_node.node_type {
-            assert_eq!(link.address, "target-file", "Address should be the part before the pipe");
-            assert_eq!(link.display_text, "Custom Display", "Display text should be the part after the pipe");
-            
+            assert_eq!(
+                link.address, "target-file",
+                "Address should be the part before the pipe"
+            );
+            assert_eq!(
+                link.display_text, "Custom Display",
+                "Display text should be the part after the pipe"
+            );
+
             // The goto_definition logic should use link.address for file resolution
-            println!("✓ Pipe link parsed correctly: address='{}', display='{}'", link.address, link.display_text);
+            println!(
+                "Pipe link parsed correctly: address='{}', display='{}'",
+                link.address, link.display_text
+            );
         } else {
             panic!("Expected Link node type");
         }

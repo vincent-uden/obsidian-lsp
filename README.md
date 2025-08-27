@@ -2,8 +2,8 @@
 
 ## Roadmap
 - [ ] Rename links -> rename files and all other links
-- [ ] Go to definition (or declaration)
-    - [ ] Link -> Navigate to the file
+- [x] Go to definition (or declaration)
+    - [x] Link -> Navigate to the file
 - [ ] References
     - [ ] Link -> Show all other links to the same file
 - [ ] Completion
@@ -11,7 +11,7 @@
     - [ ] Tags
     - [ ] Properties
 - [x] Document symbols
-- [ ] Hover?
+- [x] Hover
 - [ ] Code actions?
     - [ ] Align table
 
