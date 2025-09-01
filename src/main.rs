@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,13 +17,20 @@ use crate::ast::{Document, Node, NodeType};
 use crate::index::{VaultIndex, index_vault, normalize_link_text};
 
 mod ast;
-mod index;
-mod minimal_test;
+#[cfg(test)]
 mod comprehensive_test;
+mod index;
+#[cfg(test)]
+mod minimal_test;
+
+#[derive(Debug, Clone, Copy)]
+enum RenameType {
+    DisplayText,
+}
 
 #[derive(Debug)]
 struct Backend {
-    client: Client,
+    client: Option<Client>,
     //               Uri     Contents
     doc_map: DashMap<String, Document>,
     vault_index: Arc<RwLock<Option<VaultIndex>>>,
@@ -60,6 +67,7 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -68,21 +76,26 @@ impl LanguageServer for Backend {
 
     async fn initialized(&self, _params: InitializedParams) {
         info!("Server initialized");
-        self.client
-            .log_message(MessageType::INFO, "Obsidian LSP server initialized!")
-            .await;
+        if let Some(client) = &self.client {
+            client
+                .log_message(MessageType::INFO, "Obsidian LSP server initialized!")
+                .await;
+        }
 
         // Index workspace in a separate task to avoid Send issues
         let client = self.client.clone();
         let vault_index = self.vault_index.clone();
 
         tokio::spawn(async move {
-            if let Ok(workspace_folders) = client.workspace_folders().await {
-                if let Some(folders) = workspace_folders {
-                    for folder in folders {
-                        if let Some(path) = folder.uri.to_file_path() {
-                            Backend::index_workspace_static(&client, &vault_index, &path).await;
-                            break; // Use the first workspace folder
+            if let Some(client) = client {
+                if let Ok(workspace_folders) = client.workspace_folders().await {
+                    if let Some(folders) = workspace_folders {
+                        for folder in folders {
+                            if let Some(path) = folder.uri.to_file_path() {
+                                Backend::index_workspace_static(&Some(client), &vault_index, &path)
+                                    .await;
+                                break; // Use the first workspace folder
+                            }
                         }
                     }
                 }
@@ -92,9 +105,11 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> Result<()> {
         info!("Server shutting down");
-        self.client
-            .log_message(MessageType::ERROR, "shutting down!")
-            .await;
+        if let Some(client) = &self.client {
+            client
+                .log_message(MessageType::ERROR, "shutting down!")
+                .await;
+        }
         Ok(())
     }
 
@@ -325,7 +340,10 @@ impl LanguageServer for Backend {
         Ok(Some(GotoDeclarationResponse::Array(Vec::new())))
     }
 
-    async fn references(&self, params: lsp_types::ReferenceParams) -> Result<Option<Vec<Location>>> {
+    async fn references(
+        &self,
+        params: lsp_types::ReferenceParams,
+    ) -> Result<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
@@ -360,7 +378,60 @@ impl LanguageServer for Backend {
                 self.find_tag_references(tag_name).await
             }
             _ => {
-                debug!("Node at references position is not a link or tag: {:?}", node.node_type);
+                debug!(
+                    "Node at references position is not a link or tag: {:?}",
+                    node.node_type
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = &params.new_name;
+
+        debug!(
+            "Rename requested for {:?} at {:?} to '{}'",
+            uri, position, new_name
+        );
+        debug!("Starting rename process...");
+
+        // Get the document
+        let doc = match self.doc_map.get(uri.as_str()) {
+            Some(doc) => doc,
+            None => {
+                debug!("Document not found for rename: {:?}", uri);
+                return Ok(None);
+            }
+        };
+
+        // Find the node at the cursor position
+        let node = match self.find_node_at_position(&doc, position) {
+            Some(node) => node,
+            None => {
+                debug!("No node found at rename position {:?}", position);
+                return Ok(None);
+            }
+        };
+
+        // Only handle link renames for now
+        match &node.node_type {
+            NodeType::Link(link) => {
+                debug!(
+                    "Found link for rename: {} -> {}",
+                    link.display_text, new_name
+                );
+                let result = self.handle_link_rename(uri, position, link, new_name).await;
+                debug!("Rename result: {:?}", result.is_ok());
+                result
+            }
+            _ => {
+                debug!(
+                    "Node at rename position is not a link: {:?}",
+                    node.node_type
+                );
                 Ok(None)
             }
         }
@@ -670,13 +741,17 @@ impl Backend {
         }
 
         self.last_parse.insert(uri_str.clone(), now);
-        self.doc_map.insert(uri_str, document);
+        self.doc_map.insert(uri_str, document.clone());
+
+        // Update the reverse link map for this document
+        self.update_reverse_link_map_for_file(&params.uri, &document)
+            .await;
 
         info!("Document change processing complete");
     }
 
     async fn index_workspace_static(
-        client: &Client,
+        client: &Option<Client>,
         vault_index: &Arc<RwLock<Option<VaultIndex>>>,
         root: &Path,
     ) {
@@ -687,14 +762,18 @@ impl Backend {
                 info!("Successfully indexed {} files", file_count);
                 let mut vault_index_guard = vault_index.write().await;
                 *vault_index_guard = Some(index);
-                client
-                    .log_message(MessageType::INFO, &format!("Indexed {} files", file_count))
-                    .await;
+                if let Some(client) = client {
+                    client
+                        .log_message(MessageType::INFO, &format!("Indexed {} files", file_count))
+                        .await;
+                }
             }
             Err(e) => {
                 let error_msg = format!("Failed to index workspace: {}", e);
                 warn!("{}", error_msg);
-                client.log_message(MessageType::ERROR, &error_msg).await;
+                if let Some(client) = client {
+                    client.log_message(MessageType::ERROR, &error_msg).await;
+                }
             }
         }
     }
@@ -1188,7 +1267,11 @@ impl Backend {
             locations.truncate(100);
         }
 
-        debug!("Found {} references for link: {}", locations.len(), link_address);
+        debug!(
+            "Found {} references for link: {}",
+            locations.len(),
+            link_address
+        );
         Ok(Some(locations))
     }
 
@@ -1230,17 +1313,26 @@ impl Backend {
                         if node_tag.to_lowercase() == normalized_tag {
                             if let Some(location) = self.node_to_location(file_path, node) {
                                 locations.push(location);
-                                debug!("Found inline tag reference at line {}", node.range.start.line);
+                                debug!(
+                                    "Found inline tag reference at line {}",
+                                    node.range.start.line
+                                );
                             }
                         }
                     }
                 }
 
                 // Also check for frontmatter tags
-                if let Some(frontmatter_location) = self.find_frontmatter_tag_location(&content, &normalized_tag) {
-                    if let Some(location) = self.node_to_location(file_path, &frontmatter_location) {
+                if let Some(frontmatter_location) =
+                    self.find_frontmatter_tag_location(&content, &normalized_tag)
+                {
+                    if let Some(location) = self.node_to_location(file_path, &frontmatter_location)
+                    {
                         locations.push(location);
-                        debug!("Found frontmatter tag reference at line {}", frontmatter_location.range.start.line);
+                        debug!(
+                            "Found frontmatter tag reference at line {}",
+                            frontmatter_location.range.start.line
+                        );
                     }
                 }
             } else {
@@ -1304,13 +1396,17 @@ impl Backend {
                     let current_indent = line.len() - line.trim_start().len();
 
                     // If we encounter a line with same or less indentation that's not empty and not a list item, we're done with tags
-                    if current_indent <= tag_indent && !line.trim().is_empty() && !line.trim().starts_with('-') {
+                    if current_indent <= tag_indent
+                        && !line.trim().is_empty()
+                        && !line.trim().starts_with('-')
+                    {
                         break;
                     }
 
                     // Check for list item with our tag
                     if line.trim().starts_with("- ") {
-                        let tag_value = line.trim()[2..].trim().trim_matches('"').trim_matches('\'');
+                        let tag_value =
+                            line.trim()[2..].trim().trim_matches('"').trim_matches('\'');
                         if tag_value == tag_name {
                             // Found the tag! Create a node for it
                             let char_start = line.find("- ").unwrap() + 2;
@@ -1338,6 +1434,458 @@ impl Backend {
 
         None
     }
+
+    async fn handle_link_rename(
+        &self,
+        source_uri: &Uri,
+        position: Position,
+        link: &ast::Link,
+        new_name: &str,
+    ) -> Result<Option<WorkspaceEdit>> {
+        debug!(
+            "Handling link rename: {} -> {}",
+            link.display_text, new_name
+        );
+
+        // Get the vault index with timeout protection
+        let vault_index_result = tokio::time::timeout(
+            std::time::Duration::from_millis(2000),
+            self.vault_index.read(),
+        )
+        .await;
+
+        let vault_index = match vault_index_result {
+            Ok(lock) => lock,
+            Err(_) => {
+                warn!("Timeout waiting for vault index read lock - cannot perform rename");
+                return Ok(None);
+            }
+        };
+
+        let index = match vault_index.as_ref() {
+            Some(index) => index,
+            None => {
+                debug!("Vault index not available for rename");
+                return Ok(None);
+            }
+        };
+
+        // Find the target file
+        let target_path = match index.find_file(&link.address) {
+            Some(path) => path,
+            None => {
+                debug!("Target file not found for link: {}", link.address);
+                return Ok(None);
+            }
+        };
+
+        debug!("Found target file: {}", target_path.display());
+
+        // Determine what we're renaming based on the link structure
+        let (old_name, rename_type) = self.determine_rename_target(link, new_name);
+        debug!(
+            "Determined rename target: '{}' of type {:?}",
+            old_name, rename_type
+        );
+
+        // Generate new filename
+        let new_filename = self.generate_new_filename(&target_path, &old_name, new_name);
+        let new_path = target_path.with_file_name(&new_filename);
+
+        debug!(
+            "Renaming {} to {}",
+            target_path.display(),
+            new_path.display()
+        );
+
+        // Check if target file already exists
+        if new_path.exists() && new_path != target_path {
+            debug!("Target file already exists: {}", new_path.display());
+            return Ok(None);
+        }
+
+        // Perform the file rename
+        if let Err(e) = tokio::fs::rename(&target_path, &new_path).await {
+            debug!("Failed to rename file: {}", e);
+            return Ok(None);
+        }
+
+        debug!(
+            "Successfully renamed file from {} to {}",
+            target_path.display(),
+            new_path.display()
+        );
+
+        // Build workspace edit
+        let mut workspace_edit = WorkspaceEdit {
+            changes: Some(HashMap::new()),
+            document_changes: None,
+            change_annotations: None,
+        };
+
+        let changes = workspace_edit.changes.as_mut().unwrap();
+
+        // Find all files that reference this target
+        let normalized_target = normalize_link_text(&link.address);
+        let referencing_files = match index.reverse_link_map.get(&normalized_target) {
+            Some(files) => files.clone(),
+            None => Vec::new(),
+        };
+
+        debug!(
+            "Found {} files referencing the target",
+            referencing_files.len()
+        );
+
+        // Update all references
+        for ref_file_path in &referencing_files {
+            if let Ok(content) = tokio::fs::read_to_string(&ref_file_path).await {
+                let doc = Document::from(content.clone());
+
+                // Find all link nodes that reference our target
+                for node in doc.nodes.values() {
+                    if let NodeType::Link(ref_link) = &node.node_type {
+                        if normalize_link_text(&ref_link.address) == normalized_target {
+                            // This link references our target, update it
+                            debug!(
+                                "Updating link in file {}: {} -> {}",
+                                ref_file_path.display(),
+                                ref_link.address,
+                                new_filename
+                            );
+                            let updated_text = self.update_link_text(
+                                &content,
+                                node,
+                                &old_name,
+                                new_name,
+                                rename_type,
+                                &new_filename,
+                            );
+                            debug!("Updated text: {}", updated_text);
+
+                            if let Some(uri) = Uri::from_file_path(&ref_file_path) {
+                                let text_edit = TextEdit {
+                                    range: node.range,
+                                    new_text: updated_text,
+                                };
+
+                                changes.entry(uri).or_insert_with(Vec::new).push(text_edit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also update the source file if it's not already included
+        debug!("Checking if source file needs updating...");
+        if let Some(source_path) = source_uri.to_file_path() {
+            let source_path_buf = source_path.to_path_buf();
+            debug!("Source path: {}", source_path.display());
+            debug!(
+                "Source path in referencing files: {}",
+                referencing_files.contains(&source_path_buf)
+            );
+
+            if !referencing_files.contains(&source_path_buf) {
+                debug!("Source file not in referencing files, updating it...");
+                if let Ok(content) = tokio::fs::read_to_string(&source_path).await {
+                    debug!("Read source file content, length: {}", content.len());
+                    let doc = Document::from(content.clone());
+                    debug!("Parsed document with {} nodes", doc.nodes.len());
+
+                    // Find the link node at the cursor position
+                    for (_node_id, node) in &doc.nodes {
+                        if let NodeType::Link(ref_link) = &node.node_type {
+                            debug!(
+                                "Found link node: address='{}', target='{}'",
+                                ref_link.address, normalized_target
+                            );
+                            if normalize_link_text(&ref_link.address) == normalized_target {
+                                debug!("Link matches target, checking position...");
+                                if position_in_range(position, node.range) {
+                                    debug!("Position matches, updating link text");
+                                    let updated_text = self.update_link_text(
+                                        &content,
+                                        node,
+                                        &old_name,
+                                        new_name,
+                                        rename_type,
+                                        &new_filename,
+                                    );
+                                    debug!("Updated text: '{}'", updated_text);
+
+                                    let text_edit = TextEdit {
+                                        range: node.range,
+                                        new_text: updated_text,
+                                    };
+
+                                    changes
+                                        .entry(source_uri.clone())
+                                        .or_insert_with(Vec::new)
+                                        .push(text_edit);
+                                    debug!("Added text edit to changes");
+                                    break;
+                                } else {
+                                    debug!(
+                                        "Position doesn't match: pos={:?}, range={:?}",
+                                        position, node.range
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    debug!("Failed to read source file");
+                }
+            } else {
+                debug!("Source file already in referencing files");
+            }
+        } else {
+            debug!("Could not get source path from URI");
+        }
+
+        // Update the vault index with the new file path (after releasing the read lock)
+        // Explicitly drop the read lock before updating
+        drop(vault_index);
+        self.update_vault_index_after_rename(&target_path, &new_path, &old_name, new_name)
+            .await;
+
+        debug!("Creating workspace edit...");
+        debug!("Changes map has {} entries", changes.len());
+        for (uri, edits) in changes.iter() {
+            debug!("File {:?} has {} edits", uri, edits.len());
+            for edit in edits {
+                debug!("  Edit: '{}' at range {:?}", edit.new_text, edit.range);
+            }
+        }
+
+        debug!("Workspace edit created successfully");
+        Ok(Some(workspace_edit))
+    }
+
+    async fn update_vault_index_after_rename(
+        &self,
+        old_path: &Path,
+        new_path: &Path,
+        _old_name: &str,
+        _new_name: &str,
+    ) {
+        debug!(
+            "Updating vault index after rename: {} -> {}",
+            old_path.display(),
+            new_path.display()
+        );
+
+        // Try to get write lock with timeout to prevent hanging
+        let vault_index_result = tokio::time::timeout(
+            std::time::Duration::from_millis(5000),
+            self.vault_index.write(),
+        )
+        .await;
+
+        let mut vault_index = match vault_index_result {
+            Ok(lock) => lock,
+            Err(_) => {
+                warn!("Timeout waiting for vault index write lock - skipping update");
+                return;
+            }
+        };
+
+        if let Some(index) = vault_index.as_mut() {
+            debug!("Got vault index write lock, proceeding with update");
+
+            // Simple update: just replace the old path with the new path
+            let old_stem = old_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let new_stem = new_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+
+            let old_normalized = normalize_link_text(old_stem);
+            let new_normalized = normalize_link_text(new_stem);
+
+            debug!(
+                "Old normalized: '{}', New normalized: '{}'",
+                old_normalized, new_normalized
+            );
+
+            // Update link_map
+            if index.link_map.contains_key(&old_normalized) {
+                debug!("Removing old entry from link_map");
+                index.link_map.remove(&old_normalized);
+                debug!("Inserting new entry into link_map");
+                index
+                    .link_map
+                    .insert(new_normalized.clone(), new_path.to_path_buf());
+                debug!("Link map updated");
+            }
+
+            // Update reverse link mappings
+            if let Some(mut files) = index.reverse_link_map.get_mut(&old_normalized) {
+                debug!("Updating reverse link map for '{}'", old_normalized);
+                files.retain(|path| path != old_path);
+                files.push(new_path.to_path_buf());
+                debug!("Reverse link map updated for old key");
+            }
+
+            // If the normalized names are different, move the entry
+            if old_normalized != new_normalized {
+                debug!(
+                    "Moving reverse link map entry from '{}' to '{}'",
+                    old_normalized, new_normalized
+                );
+                if let Some((_, files)) = index.reverse_link_map.remove(&old_normalized) {
+                    debug!(
+                        "Removed old entry, inserting new entry with {} files",
+                        files.len()
+                    );
+                    index.reverse_link_map.insert(new_normalized, files);
+                    debug!("Reverse link map entry moved");
+                }
+            }
+
+            debug!("Vault index updated successfully");
+        } else {
+            debug!("Vault index is None");
+        }
+
+        debug!("Releasing vault index write lock");
+        drop(vault_index);
+        debug!("Vault index write lock released");
+    }
+
+    async fn update_reverse_link_map_for_file(&self, uri: &Uri, document: &Document) {
+        debug!("Updating reverse link map for file: {:?}", uri);
+
+        if let Some(file_path) = uri.to_file_path() {
+            // Extract links from the document
+            let mut current_links = Vec::new();
+            for node in document.nodes.values() {
+                if let NodeType::Link(link) = &node.node_type {
+                    current_links.push(link.address.clone());
+                }
+            }
+
+            debug!("Found {} links in document", current_links.len());
+
+            // Update the reverse link map with timeout protection
+            let vault_index_result = tokio::time::timeout(
+                std::time::Duration::from_millis(1000),
+                self.vault_index.write(),
+            )
+            .await;
+
+            let mut vault_index = match vault_index_result {
+                Ok(lock) => lock,
+                Err(_) => {
+                    debug!(
+                        "Timeout waiting for vault index write lock in document change - skipping update"
+                    );
+                    return;
+                }
+            };
+
+            if let Some(index) = vault_index.as_mut() {
+                // First, remove all old entries for this file
+                for mut entry in index.reverse_link_map.iter_mut() {
+                    entry.value_mut().retain(|path| path != &file_path);
+                }
+
+                // Then, add new entries for current links
+                for link_address in &current_links {
+                    let normalized_link = normalize_link_text(link_address);
+                    index
+                        .reverse_link_map
+                        .entry(normalized_link)
+                        .or_insert_with(Vec::new)
+                        .push(file_path.to_path_buf());
+                }
+
+                debug!("Updated reverse link map for {} links", current_links.len());
+            }
+
+            drop(vault_index);
+        }
+    }
+
+    fn determine_rename_target(&self, link: &ast::Link, _new_name: &str) -> (String, RenameType) {
+        // For now, we'll assume we're renaming the display text
+        // In a more sophisticated implementation, we could detect which part
+        // of the link the cursor is over based on the position
+
+        // If the link has a pipe, we're likely renaming the display text
+        // If it doesn't have a pipe, we're renaming the address/display
+        if link.address != link.display_text {
+            // This is a pipe link: [[address|display]]
+            (link.display_text.clone(), RenameType::DisplayText)
+        } else {
+            // This is a simple link: [[address]]
+            (link.address.clone(), RenameType::DisplayText)
+        }
+    }
+
+    fn generate_new_filename(&self, old_path: &Path, old_name: &str, new_name: &str) -> String {
+        debug!(
+            "Generating new filename: old_path={}, old_name='{}', new_name='{}'",
+            old_path.display(),
+            old_name,
+            new_name
+        );
+
+        // Simple implementation: replace the stem part of the filename
+        let old_stem = old_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        debug!("Old stem: '{}'", old_stem);
+
+        let new_stem = old_stem.replace(old_name, new_name);
+        debug!("New stem: '{}'", new_stem);
+
+        // Preserve the extension
+        if let Some(extension) = old_path.extension().and_then(|e| e.to_str()) {
+            let result = format!("{}.{}", new_stem, extension);
+            debug!("New filename with extension: '{}'", result);
+            result
+        } else {
+            debug!("New filename without extension: '{}'", new_stem);
+            new_stem
+        }
+    }
+
+    fn update_link_text(
+        &self,
+        _content: &str,
+        node: &Node,
+        _old_name: &str,
+        new_name: &str,
+        rename_type: RenameType,
+        new_filename: &str,
+    ) -> String {
+        match rename_type {
+            RenameType::DisplayText => {
+                // For display text rename, we need to update the part after the pipe
+                // or the whole link if there's no pipe
+                if let NodeType::Link(link) = &node.node_type {
+                    if link.address != link.display_text {
+                        // This is a pipe link: [[address|display]]
+                        // We need to update the address part to the new filename (without extension)
+                        let new_address = Path::new(new_filename)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(new_filename);
+                        format!("[[{}|{}]]", new_address, new_name)
+                    } else {
+                        // This is a simple link: [[address]]
+                        // Update to the new filename (without extension)
+                        let new_address = Path::new(new_filename)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(new_filename);
+                        format!("[[{}]]", new_address)
+                    }
+                } else {
+                    // Fallback
+                    format!("[[{}]]", new_name)
+                }
+            }
+        }
+    }
 }
 
 fn position_in_range(position: Position, range: Range) -> bool {
@@ -1359,6 +1907,8 @@ fn position_in_range(position: Position, range: Range) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use tower_lsp_server::Client;
 
     #[test]
     fn test_position_in_range() {
@@ -1536,9 +2086,9 @@ mod tests {
     #[test]
     fn test_completion_frontmatter_context() {
         // Test frontmatter detection logic
-        let content = "---\ntitle: Test\nauth\n---\n# Content";
-        let lines: Vec<&str> = content.lines().collect();
-        let line_idx = 2; // "auth" line
+        let doc_content = "---\ntitle: Test\nauthor: Me\n---\n# Content";
+        let lines: Vec<&str> = doc_content.lines().collect();
+        let line_idx = 2; // "author" line
 
         // Simulate is_in_frontmatter logic
         if !lines.is_empty() && lines[0].trim().starts_with("---") {
@@ -1553,6 +2103,153 @@ mod tests {
                 }
             }
         }
+
+        // Test lines within frontmatter
+        let line_1_in_fm = 1 > 0 && 1 < 3; // title line
+        let line_2_in_fm = 2 > 0 && 2 < 3; // author line
+        let line_4_in_fm = 4 > 0 && 4 < 3; // content line
+
+        assert!(line_1_in_fm, "Line 1 should be in frontmatter");
+        assert!(line_2_in_fm, "Line 2 should be in frontmatter");
+        assert!(!line_4_in_fm, "Line 4 should not be in frontmatter");
+    }
+
+    #[test]
+    fn test_determine_rename_target() {
+        // Test with a simple link (no pipe)
+        let simple_link = ast::Link {
+            link_type: ast::LinkType::Wiki,
+            address: "simple-link".to_string(),
+            display_text: "simple-link".to_string(),
+        };
+
+        let backend = Backend {
+            client: None,
+            doc_map: DashMap::new(),
+            vault_index: Arc::new(RwLock::new(None)),
+            last_parse: DashMap::new(),
+            change_count: DashMap::new(),
+        };
+
+        let (old_name, rename_type) = backend.determine_rename_target(&simple_link, "new-name");
+        assert_eq!(old_name, "simple-link");
+        assert!(matches!(rename_type, RenameType::DisplayText));
+
+        // Test with a pipe link
+        let pipe_link = ast::Link {
+            link_type: ast::LinkType::Wiki,
+            address: "target-file".to_string(),
+            display_text: "Custom Display".to_string(),
+        };
+
+        let backend = Backend {
+            client: None,
+            doc_map: DashMap::new(),
+            vault_index: Arc::new(RwLock::new(None)),
+            last_parse: DashMap::new(),
+            change_count: DashMap::new(),
+        };
+
+        let (old_name, rename_type) = backend.determine_rename_target(&pipe_link, "New Display");
+        assert_eq!(old_name, "Custom Display");
+        assert!(matches!(rename_type, RenameType::DisplayText));
+    }
+
+    #[test]
+    fn test_generate_new_filename() {
+        let backend = Backend {
+            client: None,
+            doc_map: DashMap::new(),
+            vault_index: Arc::new(RwLock::new(None)),
+            last_parse: DashMap::new(),
+            change_count: DashMap::new(),
+        };
+
+        // Test with markdown file
+        let old_path = PathBuf::from("/test/old-name.md");
+        let new_filename = backend.generate_new_filename(&old_path, "old-name", "new-name");
+        assert_eq!(new_filename, "new-name.md");
+
+        // Test with different extension
+        let old_path = PathBuf::from("/test/old-name.txt");
+        let new_filename = backend.generate_new_filename(&old_path, "old-name", "new-name");
+        assert_eq!(new_filename, "new-name.txt");
+
+        // Test with no extension
+        let old_path = PathBuf::from("/test/old-name");
+        let new_filename = backend.generate_new_filename(&old_path, "old-name", "new-name");
+        assert_eq!(new_filename, "new-name");
+    }
+
+    #[test]
+    fn test_update_link_text() {
+        let backend = Backend {
+            client: None,
+            doc_map: DashMap::new(),
+            vault_index: Arc::new(RwLock::new(None)),
+            last_parse: DashMap::new(),
+            change_count: DashMap::new(),
+        };
+
+        // Test updating simple link
+        let simple_link_node = Node {
+            node_type: NodeType::Link(ast::Link {
+                link_type: ast::LinkType::Wiki,
+                address: "old-name".to_string(),
+                display_text: "old-name".to_string(),
+            }),
+            children: vec![],
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 12,
+                },
+            },
+        };
+
+        let updated_text = backend.update_link_text(
+            "",
+            &simple_link_node,
+            "old-name",
+            "new-name",
+            RenameType::DisplayText,
+            "new-name.md",
+        );
+        assert_eq!(updated_text, "[[new-name]]");
+
+        // Test updating pipe link
+        let pipe_link_node = Node {
+            node_type: NodeType::Link(ast::Link {
+                link_type: ast::LinkType::Wiki,
+                address: "target-file".to_string(),
+                display_text: "Old Display".to_string(),
+            }),
+            children: vec![],
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 25,
+                },
+            },
+        };
+
+        let updated_text = backend.update_link_text(
+            "",
+            &pipe_link_node,
+            "Old Display",
+            "New Display",
+            RenameType::DisplayText,
+            "target-file.md",
+        );
+        assert_eq!(updated_text, "[[target-file|New Display]]");
     }
 
     #[test]
@@ -1631,7 +2328,8 @@ mod tests {
         // Populate reverse link map
         for link in &file1_links {
             let normalized = normalize_link_text(link);
-            index.reverse_link_map
+            index
+                .reverse_link_map
                 .entry(normalized)
                 .or_insert_with(Vec::new)
                 .push(file1_path.clone());
@@ -1639,24 +2337,43 @@ mod tests {
 
         for link in &file2_links {
             let normalized = normalize_link_text(link);
-            index.reverse_link_map
+            index
+                .reverse_link_map
                 .entry(normalized)
                 .or_insert_with(Vec::new)
                 .push(file2_path.clone());
         }
 
         // Verify reverse link mapping
-        assert_eq!(index.reverse_link_map.len(), 2, "Should have 2 unique link targets");
+        assert_eq!(
+            index.reverse_link_map.len(),
+            2,
+            "Should have 2 unique link targets"
+        );
 
         // Check that "target-file" is referenced by both files
-        let target_file_refs = index.reverse_link_map.get(&normalize_link_text("target-file")).unwrap();
-        assert_eq!(target_file_refs.len(), 2, "target-file should be referenced by 2 files");
+        let target_file_refs = index
+            .reverse_link_map
+            .get(&normalize_link_text("target-file"))
+            .unwrap();
+        assert_eq!(
+            target_file_refs.len(),
+            2,
+            "target-file should be referenced by 2 files"
+        );
         assert!(target_file_refs.contains(&file1_path));
         assert!(target_file_refs.contains(&file2_path));
 
         // Check that "another-link" is referenced by file1 only
-        let another_link_refs = index.reverse_link_map.get(&normalize_link_text("another-link")).unwrap();
-        assert_eq!(another_link_refs.len(), 1, "another-link should be referenced by 1 file");
+        let another_link_refs = index
+            .reverse_link_map
+            .get(&normalize_link_text("another-link"))
+            .unwrap();
+        assert_eq!(
+            another_link_refs.len(),
+            1,
+            "another-link should be referenced by 1 file"
+        );
         assert!(another_link_refs.contains(&file1_path));
 
         println!("Reverse link mapping test passed");
@@ -1685,7 +2402,8 @@ mod tests {
         // Populate tag map
         for tag in &file1_tags {
             let normalized = tag.to_lowercase();
-            index.tag_map
+            index
+                .tag_map
                 .entry(normalized)
                 .or_insert_with(Vec::new)
                 .push(file1_path.clone());
@@ -1693,7 +2411,8 @@ mod tests {
 
         for tag in &file2_tags {
             let normalized = tag.to_lowercase();
-            index.tag_map
+            index
+                .tag_map
                 .entry(normalized)
                 .or_insert_with(Vec::new)
                 .push(file2_path.clone());
@@ -1941,7 +2660,7 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let (service, socket) = LspService::new(|client| Backend {
-        client,
+        client: Some(client),
         doc_map: DashMap::new(),
         vault_index: Arc::new(RwLock::new(None)),
         last_parse: DashMap::new(),

@@ -1,11 +1,12 @@
 # Obsidian LSP
 
 ## Roadmap
-- [ ] Rename links -> rename files and all other links
+- [x] Rename links -> rename files and all other links
 - [x] Go to definition (or declaration)
     - [x] Link -> Navigate to the file
-- [ ] References
-    - [ ] Link -> Show all other links to the same file
+- [x] References
+    - [x] Link -> Show all other links to the same file
+    - [x] Tag -> Show all other places where the tag is used
 - [x] Completion
     - [x] Links
     - [x] Tags
