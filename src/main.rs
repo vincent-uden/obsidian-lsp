@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde_json;
+
 use dashmap::DashMap;
 use tokio::fs;
 use tokio::sync::RwLock;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::lsp_types::request::GotoDeclarationResponse;
-use tower_lsp_server::lsp_types::{self, *};
+use tower_lsp_server::lsp_types::{self, *, CodeActionOrCommand, CodeActionProviderCapability};
 use tower_lsp_server::{Client, LanguageServer, LspService, Server, UriExt};
 use tracing::{Level, debug, info, warn};
 
@@ -68,6 +70,7 @@ impl LanguageServer for Backend {
                 }),
                 references_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -684,6 +687,72 @@ impl LanguageServer for Backend {
 
         Ok(None)
     }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = &params.text_document.uri;
+        let range = params.range;
+
+        debug!("Code action requested for {:?} at range {:?}", uri, range);
+
+        // Get the document
+        let doc = match self.doc_map.get(uri.as_str()) {
+            Some(doc) => doc,
+            None => {
+                debug!("Document not found for code action: {:?}", uri);
+                return Ok(None);
+            }
+        };
+
+        // Check if there's a table at the cursor position
+        let mut actions = Vec::new();
+
+        for node in doc.nodes.values() {
+            if let NodeType::Table(table) = &node.node_type {
+                // Check if the range intersects with the table
+                if self.range_intersects(range, node.range) {
+                    debug!("Found table intersecting with cursor range");
+
+                    // Generate the formatted table
+                    let formatted_table = self.format_table(table);
+
+                    // Create workspace edit
+                    let mut changes = HashMap::new();
+                    let text_edit = TextEdit {
+                        range: node.range,
+                        new_text: formatted_table.trim_end().to_string(),
+                    };
+                    changes.insert(uri.clone(), vec![text_edit]);
+
+                    let workspace_edit = WorkspaceEdit {
+                        changes: Some(changes),
+                        document_changes: None,
+                        change_annotations: None,
+                    };
+
+                    // Create a format table code action
+                    let action = CodeAction {
+                        title: "Format Table".to_string(),
+                        kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                        diagnostics: None,
+                        edit: Some(workspace_edit),
+                        command: None,
+                        is_preferred: Some(true),
+                        disabled: None,
+                        data: None,
+                    };
+
+                    actions.push(CodeActionOrCommand::CodeAction(action));
+                    break; // Only provide one action per table
+                }
+            }
+        }
+
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
+    }
 }
 
 impl Backend {
@@ -776,6 +845,14 @@ impl Backend {
                 }
             }
         }
+    }
+
+    fn range_intersects(&self, range1: Range, range2: Range) -> bool {
+        // Check if range1 intersects with range2
+        !(range1.end.line < range2.start.line ||
+          range1.start.line > range2.end.line ||
+          (range1.end.line == range2.start.line && range1.end.character <= range2.start.character) ||
+          (range1.start.line == range2.end.line && range1.start.character >= range2.end.character))
     }
 
     fn find_node_at_position<'a>(&self, doc: &'a Document, position: Position) -> Option<&'a Node> {
@@ -1814,10 +1891,8 @@ impl Backend {
         // If the link has a pipe, we're likely renaming the display text
         // If it doesn't have a pipe, we're renaming the address/display
         if link.address != link.display_text {
-            // This is a pipe link: [[address|display]]
             (link.display_text.clone(), RenameType::DisplayText)
         } else {
-            // This is a simple link: [[address]]
             (link.address.clone(), RenameType::DisplayText)
         }
     }
@@ -1846,6 +1921,99 @@ impl Backend {
             debug!("New filename without extension: '{}'", new_stem);
             new_stem
         }
+    }
+
+    fn format_table(&self, table: &ast::Table) -> String {
+        // Calculate column widths
+        let mut column_widths = vec![0; table.headers.len()];
+
+        // Check header widths
+        for (i, header) in table.headers.iter().enumerate() {
+            column_widths[i] = column_widths[i].max(header.len());
+        }
+
+        // Check data row widths
+        for row in &table.rows {
+            for (i, cell) in row.iter().enumerate() {
+                if i < column_widths.len() {
+                    column_widths[i] = column_widths[i].max(cell.len());
+                }
+            }
+        }
+
+        let mut result = String::new();
+
+        // Format header row
+        result.push('|');
+        for (i, header) in table.headers.iter().enumerate() {
+            result.push(' ');
+            result.push_str(header);
+            let padding = column_widths[i] - header.len();
+            for _ in 0..padding {
+                result.push(' ');
+            }
+            result.push_str(" |");
+        }
+        result.push('\n');
+
+        // Format separator row
+        result.push('|');
+        for i in 0..table.headers.len() {
+            result.push(' ');
+            if table.has_alignment_markers {
+                // Use alignment markers if they were originally present
+                match table.alignments.get(i) {
+                    Some(ast::ColumnAlignment::Left) => {
+                        result.push(':');
+                        for _ in 0..(column_widths[i] - 1) {
+                            result.push('-');
+                        }
+                    }
+                    Some(ast::ColumnAlignment::Center) => {
+                        result.push(':');
+                        for _ in 0..(column_widths[i] - 2) {
+                            result.push('-');
+                        }
+                        result.push(':');
+                    }
+                    Some(ast::ColumnAlignment::Right) => {
+                        for _ in 0..(column_widths[i] - 1) {
+                            result.push('-');
+                        }
+                        result.push(':');
+                    }
+                    _ => {
+                        for _ in 0..column_widths[i] {
+                            result.push('-');
+                        }
+                    }
+                }
+            } else {
+                // Use simple dashes if no alignment markers were originally present
+                for _ in 0..column_widths[i] {
+                    result.push('-');
+                }
+            }
+            result.push_str(" |");
+        }
+        result.push('\n');
+
+        // Format data rows
+        for row in &table.rows {
+            result.push('|');
+            for (i, cell) in row.iter().enumerate() {
+                result.push(' ');
+                result.push_str(cell);
+                let padding = column_widths[i] - cell.len();
+                for _ in 0..padding {
+                    result.push(' ');
+                }
+                result.push_str(" |");
+            }
+            result.push('\n');
+        }
+
+        result
     }
 
     fn update_link_text(

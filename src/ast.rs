@@ -15,6 +15,7 @@ pub enum NodeType {
     Paragraph,
     Link(Link),
     Tag(String),
+    Table(Table),
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +29,22 @@ pub struct Link {
 pub enum LinkType {
     Web,
     Wiki,
+}
+
+#[derive(Debug, Clone)]
+pub struct Table {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub alignments: Vec<ColumnAlignment>,
+    pub has_alignment_markers: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ColumnAlignment {
+    Left,
+    Center,
+    Right,
+    None,
 }
 
 /// (line, col)
@@ -52,6 +69,204 @@ fn parse_wiki_link_text(link_text: &str) -> (String, String) {
 impl Document {
     fn extract_wiki_links(&mut self) {
         self.extract_links_and_tags();
+    }
+
+    fn extract_tables(&mut self) {
+        let lines: Vec<&str> = self.contents.lines().collect();
+        let mut i = 0;
+
+        while i < lines.len() {
+            if let Some((table, table_end_line)) = self.parse_table_at_line(&lines, i) {
+                let table_start_line = i;
+
+                let range = Range {
+                    start: Position {
+                        line: table_start_line as u32,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: table_end_line as u32,
+                        character: lines.get(table_end_line).map(|l| l.len() as u32).unwrap_or(0),
+                    },
+                };
+
+                let node_id = (table_start_line, 0);
+                self.nodes.insert(
+                    node_id,
+                    Node {
+                        node_type: NodeType::Table(table),
+                        children: vec![],
+                        range,
+                    },
+                );
+
+                // Skip the lines we've processed
+                i = table_end_line + 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn parse_table_at_line(&self, lines: &[&str], start_line: usize) -> Option<(Table, usize)> {
+        if start_line >= lines.len() {
+            return None;
+        }
+
+        // Check if this line looks like a table header
+        let header_line = lines[start_line];
+        if !self.is_table_row(header_line) {
+            return None;
+        }
+
+        // Parse header row
+        let headers = self.parse_table_row(header_line)?;
+
+        // Check for separator row
+        if start_line + 1 >= lines.len() {
+            return None;
+        }
+        let separator_line = lines[start_line + 1];
+        if !self.is_separator_row(separator_line) {
+            return None;
+        }
+
+        // Parse alignments from separator
+        let alignments = self.parse_separator_alignments(separator_line, headers.len())?;
+
+        // Check if the original separator had alignment markers
+        let has_alignment_markers = self.separator_has_alignment_markers(separator_line);
+
+        // Parse data rows
+        let mut rows = Vec::new();
+        let mut current_line = start_line + 2;
+
+        while current_line < lines.len() {
+            let line = lines[current_line];
+            if line.trim().is_empty() {
+                break; // Empty line ends the table
+            }
+            if !self.is_table_row(line) {
+                break; // Non-table row ends the table
+            }
+
+            if let Some(row) = self.parse_table_row(line) {
+                if row.len() == headers.len() {
+                    rows.push(row);
+                } else {
+                    break; // Row with different column count ends the table
+                }
+            } else {
+                break;
+            }
+
+            current_line += 1;
+        }
+
+        Some((Table {
+            headers,
+            rows,
+            alignments,
+            has_alignment_markers,
+        }, current_line - 1)) // current_line is the line after the last table row
+    }
+
+    fn is_table_row(&self, line: &str) -> bool {
+        let trimmed = line.trim();
+        trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 2
+    }
+
+    fn is_separator_row(&self, line: &str) -> bool {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
+            return false;
+        }
+
+        // Check if all cells contain only dashes, colons, and spaces
+        let cells: Vec<&str> = trimmed.split('|').collect();
+        for cell in cells.iter().skip(1).take(cells.len() - 2) {
+            let cell_trimmed = cell.trim();
+            if cell_trimmed.is_empty() {
+                continue;
+            }
+            if !cell_trimmed.chars().all(|c| c == '-' || c == ':' || c.is_whitespace()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn parse_table_row(&self, line: &str) -> Option<Vec<String>> {
+        if !self.is_table_row(line) {
+            return None;
+        }
+
+        let trimmed = line.trim();
+        let content = &trimmed[1..trimmed.len() - 1]; // Remove outer pipes
+
+        let cells: Vec<String> = content
+            .split('|')
+            .map(|cell| cell.trim().to_string())
+            .collect();
+
+        Some(cells)
+    }
+
+    fn parse_separator_alignments(&self, line: &str, expected_columns: usize) -> Option<Vec<ColumnAlignment>> {
+        if !self.is_separator_row(line) {
+            return None;
+        }
+
+        let trimmed = line.trim();
+        let content = &trimmed[1..trimmed.len() - 1];
+        let cells: Vec<&str> = content.split('|').collect();
+
+        if cells.len() != expected_columns {
+            return None;
+        }
+
+        let mut alignments = Vec::new();
+
+        for cell in &cells {
+            let trimmed_cell = cell.trim();
+            if trimmed_cell.is_empty() {
+                alignments.push(ColumnAlignment::Left);
+                continue;
+            }
+
+            let starts_with_colon = trimmed_cell.starts_with(':');
+            let ends_with_colon = trimmed_cell.ends_with(':');
+
+            let alignment = match (starts_with_colon, ends_with_colon) {
+                (true, true) => ColumnAlignment::Center,
+                (false, true) => ColumnAlignment::Right,
+                (true, false) => ColumnAlignment::Left,
+                (false, false) => ColumnAlignment::Left,
+            };
+
+            alignments.push(alignment);
+        }
+
+        Some(alignments)
+    }
+
+    fn separator_has_alignment_markers(&self, line: &str) -> bool {
+        if !self.is_separator_row(line) {
+            return false;
+        }
+
+        let trimmed = line.trim();
+        let content = &trimmed[1..trimmed.len() - 1];
+        let cells: Vec<&str> = content.split('|').collect();
+
+        for cell in &cells {
+            let trimmed_cell = cell.trim();
+            if trimmed_cell.starts_with(':') || trimmed_cell.ends_with(':') {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn extract_links_and_tags(&mut self) {
@@ -402,6 +617,7 @@ impl From<String> for Document {
         };
 
         document.extract_wiki_links();
+        document.extract_tables();
         document
     }
 }
@@ -699,5 +915,121 @@ End of document."#;
         let (address, display) = parse_wiki_link_text("|Display Only");
         assert_eq!(address, "");
         assert_eq!(display, "Display Only");
+    }
+
+    #[test]
+    fn test_parse_tables() {
+        let src = include_str!("../assets/tests/tables.md");
+        let doc: Document = src.to_string().into();
+
+        // Should have 5 headings + 5 tables + some paragraphs
+        let table_count = doc.nodes.values()
+            .filter(|node| matches!(node.node_type, NodeType::Table(_)))
+            .count();
+
+        assert_eq!(table_count, 5, "Expected 5 tables, got {}", table_count);
+
+        // Test basic table
+        let basic_table = doc.nodes.values()
+            .find(|node| {
+                if let NodeType::Table(table) = &node.node_type {
+                    table.headers.contains(&"Name".to_string())
+                } else {
+                    false
+                }
+            })
+            .expect("Should find basic table");
+
+        if let NodeType::Table(table) = &basic_table.node_type {
+            assert_eq!(table.headers, vec!["Name", "Age", "City"]);
+            assert_eq!(table.rows.len(), 2);
+            assert_eq!(table.rows[0], vec!["John", "25", "New York"]);
+            assert_eq!(table.rows[1], vec!["Jane", "30", "Los Angeles"]);
+            assert!(!table.has_alignment_markers, "Basic table should not have alignment markers");
+        }
+
+        // Test table with alignment markers
+        let alignment_table = doc.nodes.values()
+            .find(|node| {
+                if let NodeType::Table(table) = &node.node_type {
+                    table.headers.contains(&"Left".to_string())
+                } else {
+                    false
+                }
+            })
+            .expect("Should find alignment table");
+
+        if let NodeType::Table(table) = &alignment_table.node_type {
+            assert!(table.has_alignment_markers, "Alignment table should have alignment markers");
+        }
+
+        // Test alignment table
+        let alignment_table = doc.nodes.values()
+            .find(|node| {
+                if let NodeType::Table(table) = &node.node_type {
+                    table.headers.contains(&"Left".to_string())
+                } else {
+                    false
+                }
+            })
+            .expect("Should find alignment table");
+
+        if let NodeType::Table(table) = &alignment_table.node_type {
+            assert_eq!(table.alignments.len(), 3);
+            // Should have Left, Center, Right alignments
+            assert!(matches!(table.alignments[0], ColumnAlignment::Left));
+            assert!(matches!(table.alignments[1], ColumnAlignment::Center));
+            assert!(matches!(table.alignments[2], ColumnAlignment::Right));
+        }
+    }
+
+    #[test]
+    fn test_table_row_parsing() {
+        let doc = Document::from("".to_string());
+
+        // Test basic row parsing
+        let row = doc.parse_table_row("| A | B | C |").unwrap();
+        assert_eq!(row, vec!["A", "B", "C"]);
+
+        // Test row with empty cells
+        let row = doc.parse_table_row("| A |   | C |").unwrap();
+        assert_eq!(row, vec!["A", "", "C"]);
+
+        // Test row with extra whitespace
+        let row = doc.parse_table_row("|  A  |  B  |  C  |").unwrap();
+        assert_eq!(row, vec!["A", "B", "C"]);
+
+        // Test invalid row
+        assert!(doc.parse_table_row("Not a table row").is_none());
+        assert!(doc.parse_table_row("| Missing end pipe").is_none());
+    }
+
+    #[test]
+    fn test_separator_alignment_parsing() {
+        let doc = Document::from("".to_string());
+
+        // Test left alignment
+        let alignments = doc.parse_separator_alignments("| :---- | ----- | ----- |", 3).unwrap();
+        assert!(matches!(alignments[0], ColumnAlignment::Left));
+        assert!(matches!(alignments[1], ColumnAlignment::Left));
+        assert!(matches!(alignments[2], ColumnAlignment::Left));
+
+        // Test center alignment
+        let alignments = doc.parse_separator_alignments("| :----: | :----: | :----: |", 3).unwrap();
+        assert!(matches!(alignments[0], ColumnAlignment::Center));
+        assert!(matches!(alignments[1], ColumnAlignment::Center));
+        assert!(matches!(alignments[2], ColumnAlignment::Center));
+
+        // Test right alignment
+        let alignments = doc.parse_separator_alignments("| -----: | -----: | -----: |", 3).unwrap();
+        assert!(matches!(alignments[0], ColumnAlignment::Right));
+        assert!(matches!(alignments[1], ColumnAlignment::Right));
+        assert!(matches!(alignments[2], ColumnAlignment::Right));
+
+        // Test mixed alignments
+        let alignments = doc.parse_separator_alignments("| :---- | :----: | -----: |", 3).unwrap();
+        assert!(matches!(alignments[0], ColumnAlignment::Left));
+        assert!(matches!(alignments[1], ColumnAlignment::Center));
+        assert!(matches!(alignments[2], ColumnAlignment::Right));
     }
 }
