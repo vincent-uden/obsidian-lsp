@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -501,7 +502,15 @@ impl LanguageServer for Backend {
         // Determine completion context and provide appropriate completions
         if let Some(completion_items) = self.provide_completions(&doc, position, index).await {
             debug!("Providing {} completion items", completion_items.len());
-            return Ok(Some(CompletionResponse::Array(completion_items)));
+            
+            // Return incomplete completion list to force client to request fresh completions
+            // as the user types more characters instead of doing client-side filtering
+            let completion_list = CompletionList {
+                is_incomplete: true, // This forces the client to re-request as user types
+                items: completion_items,
+            };
+            
+            return Ok(Some(CompletionResponse::List(completion_list)));
         }
 
         Ok(None)
@@ -707,66 +716,114 @@ impl Backend {
     fn provide_link_completions(&self, partial: &str, index: &VaultIndex) -> Vec<CompletionItem> {
         let mut items = Vec::new();
         let partial_lower = partial.to_lowercase();
-        let partial_normalized = partial_lower.replace(' ', "-").replace('_', "-");
         
-        debug!("Providing link completions for partial: '{}' (normalized: '{}')", partial, partial_normalized);
+        debug!("Providing link completions for partial: '{}'", partial);
+        
+        // Detect if this looks like a date/numeric query
+        let is_numeric_query = partial.chars().any(|c| c.is_numeric());
+
+        // Use a HashSet to prevent duplicates
+        let mut seen_files = HashSet::new();
 
         for entry in index.link_map.iter() {
             let (link_key, file_path) = (entry.key(), entry.value());
             
-            // Check if the partial matches the link key (which is already normalized)
-            // Also check the original file name for more flexible matching
+            // Skip if we've already processed this file
+            if seen_files.contains(file_path.as_path()) {
+                continue;
+            }
+            seen_files.insert(file_path.clone());
+            
             let file_stem = file_path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown");
             let file_stem_lower = file_stem.to_lowercase();
             
-            let matches = partial.is_empty() || 
-                         link_key.contains(&partial_normalized) ||
-                         link_key.contains(&partial_lower) ||
-                         file_stem_lower.contains(&partial_lower) ||
-                         file_stem_lower.contains(&partial_normalized);
+            // Only match if partial is empty OR if there's a strong match
+            let matches = if partial.is_empty() {
+                true
+            } else {
+                // For date/numeric queries, be extra strict - require prefix match
+                if is_numeric_query {
+                    file_stem_lower.starts_with(&partial_lower) || 
+                    link_key.starts_with(&partial_lower)
+                } else {
+                    // For text queries, allow broader matching
+                    let strong_match = file_stem_lower.starts_with(&partial_lower) || 
+                                     link_key.starts_with(&partial_lower);
+                    
+                    // Allow contains match only if partial is reasonably long (3+ chars) to avoid spurious matches
+                    let medium_match = partial.len() >= 3 && (
+                        file_stem_lower.contains(&partial_lower) || 
+                        link_key.contains(&partial_lower)
+                    );
+                    
+                    strong_match || medium_match
+                }
+            };
             
             if matches {
+                // Determine match quality for better sorting
+                let exact_match = file_stem_lower == partial_lower;
+                let starts_with_match = file_stem_lower.starts_with(&partial_lower);
+                let contains_match = file_stem_lower.contains(&partial_lower);
+                
+                // Score for sorting: higher score = better match
+                // Give massive preference to prefix matches for date-like queries
+                let match_score = if exact_match {
+                    10000
+                } else if starts_with_match {
+                    1000 + (partial_lower.len() * 100) as i32 // Much higher score for prefix matches
+                } else if contains_match && partial.len() >= 3 {
+                    10 + partial_lower.len() as i32
+                } else {
+                    1
+                };
+                
                 let detail = format!("→ {}", file_path.display());
                 
-                items.push(CompletionItem {
+                let item = CompletionItem {
                     label: file_stem.to_string(),
                     detail: Some(detail),
                     kind: Some(CompletionItemKind::FILE),
                     insert_text: Some(file_stem.to_string()),
-                    filter_text: Some(format!("{} {}", file_stem, link_key)), // Help with filtering
+                    filter_text: Some(file_stem.to_string()), // Just use the stem for filtering
+                    sort_text: Some(format!("{:04}_{}", 10000 - match_score, file_stem)), // Lower sort_text = higher priority
                     ..Default::default()
-                });
+                };
                 
-                debug!("Added completion item: '{}' (matches key: '{}', stem: '{}')", file_stem, link_key, file_stem);
+                items.push(item);
+                
+                debug!("Added completion item: '{}' (score: {}, exact: {}, starts: {}, contains: {})", 
+                       file_stem, match_score, exact_match, starts_with_match, contains_match);
+            } else {
+                debug!("Rejected item: '{}' (key: '{}') - no match for '{}'", file_stem, link_key, partial);
             }
         }
 
-        // Sort by relevance (exact matches first, then starts_with, then contains)
+        // Sort by match quality (using sort_text which encodes the match score)
         items.sort_by(|a, b| {
-            let a_stem = a.label.to_lowercase();
-            let b_stem = b.label.to_lowercase();
-            
-            let a_exact = a_stem == partial_lower;
-            let b_exact = b_stem == partial_lower;
-            let a_starts = a_stem.starts_with(&partial_lower) || a_stem.starts_with(&partial_normalized);
-            let b_starts = b_stem.starts_with(&partial_lower) || b_stem.starts_with(&partial_normalized);
-            
-            match (a_exact, b_exact) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => match (a_starts, b_starts) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.label.cmp(&b.label),
-                }
-            }
+            a.sort_text.as_ref().unwrap_or(&a.label)
+                .cmp(b.sort_text.as_ref().unwrap_or(&b.label))
         });
 
-        debug!("Returning {} completion items", items.len());
-        items.truncate(50); // Limit to 50 items for performance
+        debug!("Returning {} completion items for partial '{}'", items.len(), partial);
+        
+        // For better performance with incomplete responses, limit items based on partial length
+        let max_items = if partial.is_empty() {
+            20 // Fewer items when showing everything
+        } else if partial.len() < 3 {
+            30 // Medium number for short partials  
+        } else {
+            50 // Full set for longer partials
+        };
+        
+        for (i, item) in items.iter().take(10).enumerate() {
+            debug!("  {}. {} (sort: {})", i + 1, item.label, item.sort_text.as_ref().unwrap_or(&"none".to_string()));
+        }
+
+        items.truncate(max_items);
         items
     }
 
@@ -1087,7 +1144,7 @@ mod tests {
         // More complex integration tests would require a full Backend instance
 
         // Test link completion logic
-        let mut link_index = VaultIndex::new();
+        let link_index = VaultIndex::new();
         link_index.link_map.insert("test-file".to_string(), PathBuf::from("/test/test-file.md"));
         link_index.link_map.insert("another-test".to_string(), PathBuf::from("/test/another-test.md"));
         
@@ -1095,19 +1152,127 @@ mod tests {
         assert_eq!(link_index.link_map.len(), 2, "Should have 2 link entries");
 
         // Test tag completion logic  
-        let mut tag_index = VaultIndex::new();
+        let tag_index = VaultIndex::new();
         tag_index.tag_map.insert("programming".to_string(), vec![PathBuf::from("/test/file1.md")]);
         tag_index.tag_map.insert("rust".to_string(), vec![PathBuf::from("/test/file1.md"), PathBuf::from("/test/file2.md")]);
         
         assert_eq!(tag_index.tag_map.len(), 2, "Should have 2 tag entries");
 
         // Test property completion logic
-        let mut prop_index = VaultIndex::new();
+        let prop_index = VaultIndex::new();
         prop_index.property_map.insert("custom-property".to_string(), vec![PathBuf::from("/test/file1.md")]);
         
         assert_eq!(prop_index.property_map.len(), 1, "Should have 1 property entry");
 
         println!("Basic completion provider data structures validated");
+    }
+
+    #[test]
+    fn test_date_link_completion_logic() {
+        // Test the improved matching and scoring logic for date-like completions
+        let partial = "2025";
+        let candidates = vec![
+            ("2025-01-01", "/notes/2025-01-01.md"),
+            ("2025-01-15", "/notes/2025-01-15.md"), 
+            ("2025-07-06", "/notes/2025-07-06.md"),
+            ("2024-11-05", "/notes/2024-11-05.md"), // Should NOT match "2025"
+            ("my-note", "/notes/my-note.md"),
+        ];
+        
+        // Simulate the improved matching logic
+        let partial_lower = partial.to_lowercase();
+        let is_numeric_query = partial.chars().any(|c| c.is_numeric());
+        let mut scored_items: Vec<(i32, &str)> = Vec::new();
+        
+        for (file_stem, _path) in &candidates {
+            let file_stem_lower = file_stem.to_lowercase();
+            
+            // Apply the new strict matching logic for numeric queries
+            let matches = if is_numeric_query {
+                // For numeric queries, require prefix match
+                file_stem_lower.starts_with(&partial_lower)
+            } else {
+                // For text queries, allow broader matching
+                let strong_match = file_stem_lower.starts_with(&partial_lower);
+                let medium_match = partial.len() >= 3 && file_stem_lower.contains(&partial_lower);
+                strong_match || medium_match
+            };
+            
+            if matches {
+                let exact_match = file_stem_lower == partial_lower;
+                let starts_with_match = file_stem_lower.starts_with(&partial_lower);
+                let contains_match = file_stem_lower.contains(&partial_lower);
+                
+                let match_score = if exact_match {
+                    10000
+                } else if starts_with_match {
+                    1000 + (partial_lower.len() * 100) as i32
+                } else if contains_match && partial.len() >= 3 {
+                    10 + partial_lower.len() as i32
+                } else {
+                    1
+                };
+                
+                scored_items.push((match_score, file_stem));
+            }
+        }
+        
+        // Sort by score (descending)
+        scored_items.sort_by(|a, b| b.0.cmp(&a.0));
+        
+        println!("Scored results for '{}' (numeric_query={}): {:?}", partial, is_numeric_query, scored_items);
+        
+        // For numeric query "2025", should ONLY get 2025 files, NO 2024 files
+        let sorted_names: Vec<&str> = scored_items.iter().map(|(_, name)| *name).collect();
+        
+        // Should have 3 results (all the 2025 files)
+        assert_eq!(sorted_names.len(), 3, "Should have exactly 3 matches for '2025', got: {:?}", sorted_names);
+        
+        // All results should start with "2025"
+        for name in &sorted_names {
+            assert!(name.starts_with("2025"), "All results should start with '2025', got: {}", name);
+        }
+        
+        // Should NOT contain any 2024 files
+        assert!(!sorted_names.iter().any(|name| name.contains("2024")), 
+                "Should not contain any 2024 files when searching for '2025', got: {:?}", sorted_names);
+        
+        // The first result should be one of the 2025 files
+        assert!(sorted_names[0].starts_with("2025"), "First result should start with '2025', got: {}", sorted_names[0]);
+    }
+
+    #[test]  
+    fn test_fuzzy_match_prevention() {
+        // Test that we prevent the specific issue reported: "2024-11-05" matching "2025"
+        // where LSP client finds fuzzy matches like "202" and "5" in "2024-11-05"
+        
+        let partial = "2025";
+        let problem_file = "2024-11-05"; // This should NOT match
+        let correct_file = "2025-01-01"; // This SHOULD match
+        
+        let partial_lower = partial.to_lowercase();
+        let is_numeric_query = partial.chars().any(|c| c.is_numeric());
+        
+        // Test problem file
+        let problem_file_lower = problem_file.to_lowercase();
+        let problem_matches = if is_numeric_query {
+            problem_file_lower.starts_with(&partial_lower)
+        } else {
+            problem_file_lower.contains(&partial_lower)
+        };
+        
+        // Test correct file  
+        let correct_file_lower = correct_file.to_lowercase();
+        let correct_matches = if is_numeric_query {
+            correct_file_lower.starts_with(&partial_lower)
+        } else {
+            correct_file_lower.contains(&partial_lower)
+        };
+        
+        assert!(!problem_matches, "2024-11-05 should NOT match query '2025' with strict numeric matching");
+        assert!(correct_matches, "2025-01-01 SHOULD match query '2025'");
+        
+        println!("✓ Fuzzy match prevention working: '2025' correctly excludes '2024-11-05' and includes '2025-01-01'");
     }
 
     #[test]
