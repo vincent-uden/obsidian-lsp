@@ -30,6 +30,7 @@ pub struct ObsidianFile {
 pub struct VaultIndex {
     pub files: Vec<ObsidianFile>,
     pub link_map: DashMap<String, PathBuf>,
+    pub reverse_link_map: DashMap<String, Vec<PathBuf>>,
     pub tag_map: DashMap<String, Vec<PathBuf>>,
     pub property_map: DashMap<String, Vec<PathBuf>>,
 }
@@ -39,6 +40,7 @@ impl VaultIndex {
         Self {
             files: Vec::new(),
             link_map: DashMap::new(),
+            reverse_link_map: DashMap::new(),
             tag_map: DashMap::new(),
             property_map: DashMap::new(),
         }
@@ -50,7 +52,7 @@ impl VaultIndex {
     }
 }
 
-fn normalize_link_text(text: &str) -> String {
+pub fn normalize_link_text(text: &str) -> String {
     text.trim()
         .to_lowercase()
         .replace(' ', "-")
@@ -74,9 +76,10 @@ fn extract_file_stem(path: &Path) -> String {
         .to_string()
 }
 
-async fn extract_metadata(path: &Path) -> (Vec<String>, Vec<String>, HashMap<String, String>) {
+async fn extract_metadata(path: &Path) -> (Vec<String>, Vec<String>, Vec<String>, HashMap<String, String>) {
     let mut aliases = Vec::new();
     let mut tags = Vec::new();
+    let mut links = Vec::new();
     let mut properties = HashMap::new();
 
     if let Ok(content) = fs::read_to_string(path).await {
@@ -90,7 +93,7 @@ async fn extract_metadata(path: &Path) -> (Vec<String>, Vec<String>, HashMap<Str
             }
         }
 
-        // Extract inline tags from content body
+        // Extract inline tags and links from content body
         let body = if content.starts_with("---") {
             if let Some(end) = content[3..].find("---") {
                 &content[end + 6..] // Skip past closing ---
@@ -103,9 +106,12 @@ async fn extract_metadata(path: &Path) -> (Vec<String>, Vec<String>, HashMap<Str
 
         let inline_tags = extract_inline_tags(body);
         tags.extend(inline_tags);
+
+        let inline_links = extract_links(body);
+        links.extend(inline_links);
     }
 
-    (aliases, tags, properties)
+    (aliases, tags, links, properties)
 }
 
 fn parse_frontmatter(frontmatter: &str) -> (Vec<String>, Vec<String>, HashMap<String, String>) {
@@ -223,6 +229,24 @@ fn extract_inline_tags(content: &str) -> Vec<String> {
         .collect()
 }
 
+pub fn extract_links(content: &str) -> Vec<String> {
+    use regex::Regex;
+    let link_regex = Regex::new(r"\[\[([^\]]+)\]\]").unwrap();
+
+    link_regex
+        .captures_iter(content)
+        .filter_map(|cap| {
+            let link_text = &cap[1];
+            // Handle pipe links by extracting the address part
+            if let Some(pipe_pos) = link_text.find('|') {
+                Some(link_text[..pipe_pos].trim().to_string())
+            } else {
+                Some(link_text.trim().to_string())
+            }
+        })
+        .collect()
+}
+
 pub async fn index_vault(root: &Path) -> Result<VaultIndex, String> {
     let mut index = VaultIndex::new();
     let start = Instant::now();
@@ -266,10 +290,10 @@ pub async fn index_vault(root: &Path) -> Result<VaultIndex, String> {
             .to_string();
 
         let stem = extract_file_stem(path);
-        let (aliases, tags, properties) = if matches!(kind, FileKind::Markdown) {
+        let (aliases, tags, links, properties) = if matches!(kind, FileKind::Markdown) {
             extract_metadata(path).await
         } else {
-            (Vec::new(), Vec::new(), HashMap::new())
+            (Vec::new(), Vec::new(), Vec::new(), HashMap::new())
         };
 
         let obsidian_file = ObsidianFile {
@@ -302,6 +326,15 @@ pub async fn index_vault(root: &Path) -> Result<VaultIndex, String> {
             index
                 .tag_map
                 .entry(normalized_tag)
+                .or_insert_with(Vec::new)
+                .push(path.to_path_buf());
+        }
+
+        for link in &links {
+            let normalized_link = normalize_link_text(link);
+            index
+                .reverse_link_map
+                .entry(normalized_link)
                 .or_insert_with(Vec::new)
                 .push(path.to_path_buf());
         }

@@ -9,12 +9,12 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::lsp_types::request::GotoDeclarationResponse;
-use tower_lsp_server::lsp_types::*;
+use tower_lsp_server::lsp_types::{self, *};
 use tower_lsp_server::{Client, LanguageServer, LspService, Server, UriExt};
 use tracing::{Level, debug, info, warn};
 
 use crate::ast::{Document, Node, NodeType};
-use crate::index::{VaultIndex, index_vault};
+use crate::index::{VaultIndex, index_vault, normalize_link_text};
 
 mod ast;
 mod index;
@@ -59,6 +59,7 @@ impl LanguageServer for Backend {
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
+                references_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -322,6 +323,47 @@ impl LanguageServer for Backend {
     ) -> Result<Option<request::GotoDeclarationResponse>> {
         debug!("{params:?}");
         Ok(Some(GotoDeclarationResponse::Array(Vec::new())))
+    }
+
+    async fn references(&self, params: lsp_types::ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        debug!("References requested for {:?} at {:?}", uri, position);
+
+        // Get the document
+        let doc = match self.doc_map.get(uri.as_str()) {
+            Some(doc) => doc,
+            None => {
+                debug!("Document not found for references: {:?}", uri);
+                return Ok(None);
+            }
+        };
+
+        // Find the node at the cursor position
+        let node = match self.find_node_at_position(&doc, position) {
+            Some(node) => node,
+            None => {
+                debug!("No node found at references position {:?}", position);
+                return Ok(None);
+            }
+        };
+
+        // Handle different node types
+        match &node.node_type {
+            NodeType::Link(link) => {
+                debug!("Found link for references: {}", link.address);
+                self.find_link_references(&link.address).await
+            }
+            NodeType::Tag(tag_name) => {
+                debug!("Found tag for references: {}", tag_name);
+                self.find_tag_references(tag_name).await
+            }
+            _ => {
+                debug!("Node at references position is not a link or tag: {:?}", node.node_type);
+                Ok(None)
+            }
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -1091,6 +1133,130 @@ impl Backend {
 
         false
     }
+
+    async fn find_link_references(&self, link_address: &str) -> Result<Option<Vec<Location>>> {
+        debug!("Finding references for link: {}", link_address);
+
+        // Get the vault index
+        let vault_index = self.vault_index.read().await;
+        let index = match vault_index.as_ref() {
+            Some(index) => index,
+            None => {
+                debug!("Vault index not available for link references");
+                return Ok(None);
+            }
+        };
+
+        let normalized_target = normalize_link_text(link_address);
+        let referencing_files = match index.reverse_link_map.get(&normalized_target) {
+            Some(files) => files,
+            None => {
+                debug!("No files reference link: {}", link_address);
+                return Ok(None);
+            }
+        };
+
+        let mut locations = Vec::new();
+
+        // For each file that references this target
+        for file_path in referencing_files.iter() {
+            debug!("Checking file: {}", file_path.display());
+
+            // Read and parse the file to find exact link positions
+            if let Ok(content) = tokio::fs::read_to_string(file_path).await {
+                let doc = Document::from(content);
+
+                // Find all link nodes with this address
+                for node in doc.nodes.values() {
+                    if let NodeType::Link(link) = &node.node_type {
+                        if normalize_link_text(&link.address) == normalized_target {
+                            if let Some(location) = self.node_to_location(file_path, node) {
+                                locations.push(location);
+                                debug!("Found reference at line {}", node.range.start.line);
+                            }
+                        }
+                    }
+                }
+            } else {
+                debug!("Failed to read file: {}", file_path.display());
+            }
+        }
+
+        // Limit results for performance
+        if locations.len() > 100 {
+            debug!("Limiting results from {} to 100", locations.len());
+            locations.truncate(100);
+        }
+
+        debug!("Found {} references for link: {}", locations.len(), link_address);
+        Ok(Some(locations))
+    }
+
+    async fn find_tag_references(&self, tag_name: &str) -> Result<Option<Vec<Location>>> {
+        debug!("Finding references for tag: {}", tag_name);
+
+        // Get the vault index
+        let vault_index = self.vault_index.read().await;
+        let index = match vault_index.as_ref() {
+            Some(index) => index,
+            None => {
+                debug!("Vault index not available for tag references");
+                return Ok(None);
+            }
+        };
+
+        let normalized_tag = tag_name.to_lowercase();
+        let files_with_tag = match index.tag_map.get(&normalized_tag) {
+            Some(files) => files,
+            None => {
+                debug!("No files contain tag: {}", tag_name);
+                return Ok(None);
+            }
+        };
+
+        let mut locations = Vec::new();
+
+        // For each file containing this tag
+        for file_path in files_with_tag.iter() {
+            debug!("Checking file: {}", file_path.display());
+
+            // Read and parse the file to find exact tag positions
+            if let Ok(content) = tokio::fs::read_to_string(file_path).await {
+                let doc = Document::from(content);
+
+                // Find all tag nodes with this name
+                for node in doc.nodes.values() {
+                    if let NodeType::Tag(node_tag) = &node.node_type {
+                        if node_tag.to_lowercase() == normalized_tag {
+                            if let Some(location) = self.node_to_location(file_path, node) {
+                                locations.push(location);
+                                debug!("Found tag reference at line {}", node.range.start.line);
+                            }
+                        }
+                    }
+                }
+            } else {
+                debug!("Failed to read file: {}", file_path.display());
+            }
+        }
+
+        // Limit results for performance
+        if locations.len() > 100 {
+            debug!("Limiting results from {} to 100", locations.len());
+            locations.truncate(100);
+        }
+
+        debug!("Found {} references for tag: {}", locations.len(), tag_name);
+        Ok(Some(locations))
+    }
+
+    fn node_to_location(&self, file_path: &std::path::Path, node: &Node) -> Option<Location> {
+        let uri = Uri::from_file_path(file_path)?;
+        Some(Location {
+            uri,
+            range: node.range,
+        })
+    }
 }
 
 fn position_in_range(position: Position, range: Range) -> bool {
@@ -1359,6 +1525,60 @@ mod tests {
         );
 
         println!("Basic completion provider data structures validated");
+    }
+
+    #[test]
+    fn test_reverse_link_mapping() {
+        use crate::index::{VaultIndex, extract_links, normalize_link_text};
+        use std::path::PathBuf;
+
+        // Test the reverse link mapping functionality
+        let mut index = VaultIndex::new();
+
+        // Simulate files with links
+        let file1_path = PathBuf::from("/test/file1.md");
+        let file2_path = PathBuf::from("/test/file2.md");
+
+        // File 1 contains links to "target-file" and "another-link"
+        let file1_content = "This has [[target-file]] and [[another-link|Custom Display]]";
+        let file1_links = extract_links(file1_content);
+
+        // File 2 contains a link to "target-file"
+        let file2_content = "This also links to [[target-file]]";
+        let file2_links = extract_links(file2_content);
+
+        // Populate reverse link map
+        for link in &file1_links {
+            let normalized = normalize_link_text(link);
+            index.reverse_link_map
+                .entry(normalized)
+                .or_insert_with(Vec::new)
+                .push(file1_path.clone());
+        }
+
+        for link in &file2_links {
+            let normalized = normalize_link_text(link);
+            index.reverse_link_map
+                .entry(normalized)
+                .or_insert_with(Vec::new)
+                .push(file2_path.clone());
+        }
+
+        // Verify reverse link mapping
+        assert_eq!(index.reverse_link_map.len(), 2, "Should have 2 unique link targets");
+
+        // Check that "target-file" is referenced by both files
+        let target_file_refs = index.reverse_link_map.get(&normalize_link_text("target-file")).unwrap();
+        assert_eq!(target_file_refs.len(), 2, "target-file should be referenced by 2 files");
+        assert!(target_file_refs.contains(&file1_path));
+        assert!(target_file_refs.contains(&file2_path));
+
+        // Check that "another-link" is referenced by file1 only
+        let another_link_refs = index.reverse_link_map.get(&normalize_link_text("another-link")).unwrap();
+        assert_eq!(another_link_refs.len(), 1, "another-link should be referenced by 1 file");
+        assert!(another_link_refs.contains(&file1_path));
+
+        println!("Reverse link mapping test passed");
     }
 
     #[test]

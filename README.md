@@ -6,10 +6,10 @@
     - [x] Link -> Navigate to the file
 - [ ] References
     - [ ] Link -> Show all other links to the same file
-- [ ] Completion
-    - [ ] Links
-    - [ ] Tags
-    - [ ] Properties
+- [x] Completion
+    - [x] Links
+    - [x] Tags
+    - [x] Properties
 - [x] Document symbols
 - [x] Hover
 - [ ] Code actions?
