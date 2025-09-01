@@ -339,7 +339,6 @@ dependencies = [
  "dashmap",
  "lsp-types",
  "regex",
- "serde_json",
  "tempfile",
  "tokio",
  "tower-lsp-server",

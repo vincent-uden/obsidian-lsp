@@ -1,5 +1,23 @@
 # Obsidian LSP
 
+A Language Server Protocol (LSP) implementation for Obsidian markdown files, providing features like go-to-definition, references, completion, and more for enhanced editing experience in editors like Neovim.
+
+## Installation
+
+### Via Cargo (crates.io)
+```bash
+cargo install obsidian-lsp
+```
+
+### From Source
+```bash
+git clone https://github.com/vincent-uden/obsidian-lsp
+cd obsidian-lsp
+cargo build --release
+```
+
+## Features
+
 ## Roadmap
 - [x] Rename links -> rename files and all other links
 - [x] Go to definition (or declaration)
@@ -14,9 +32,12 @@
 - [x] Document symbols
 - [x] Hover
 - [ ] Code actions?
-    - [ ] Align table
+    - [x] Align table
+    - [ ] More?
+- [ ] New daily notes
+- [ ] Create note from template
 
-## Dev setup (neovim 0.11+)
+## Development setup (neovim 0.11+)
 Create a file for the lsp configuration at `nvim/lsp/obsidian.lua`. It should contain:
 ```lua
 return {
