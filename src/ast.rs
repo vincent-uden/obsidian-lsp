@@ -103,9 +103,16 @@ impl Document {
                                 }
                             }
 
-                            for mat in tag_regex.find_iter(line) {
-                                let tag_name = mat.as_str()[1..].to_string(); // Remove the # prefix
-                                let tag_node_id = (line_num, mat.start());
+                                let mut tag_match_count = 0;
+                                for mat in tag_regex.find_iter(line) {
+                                    tag_match_count += 1;
+                                    if tag_match_count > 100 {
+                                        eprintln!("EMERGENCY: Too many tag matches in heading line: {}", tag_match_count);
+                                        break;
+                                    }
+
+                                    let tag_name = mat.as_str()[1..].to_string(); // Remove the # prefix
+                                    let tag_node_id = (line_num, mat.start());
 
                                 let range = Range {
                                     start: Position {
@@ -135,10 +142,17 @@ impl Document {
                     }
                     NodeType::Paragraph => {
                         let mut current_line = line_num;
+                        let mut loop_count = 0;
                         while current_line < lines.len()
                             && !lines[current_line].is_empty()
                             && !lines[current_line].trim_start().starts_with('#')
                         {
+                            loop_count += 1;
+
+                            if loop_count > 1000 {
+                                eprintln!("EMERGENCY: Paragraph parsing loop exceeded 1000 iterations");
+                                break;
+                            }
                             if let Some(line) = lines.get(current_line) {
                                 for mat in wiki_regex.find_iter(line) {
                                     let link_text = &line[mat.start() + 2..mat.end() - 2];
@@ -174,7 +188,14 @@ impl Document {
                                     }
                                 }
 
+                                let mut para_tag_match_count = 0;
                                 for mat in tag_regex.find_iter(line) {
+                                    para_tag_match_count += 1;
+                                    if para_tag_match_count > 100 {
+                                        eprintln!("EMERGENCY: Too many tag matches in paragraph line: {}", para_tag_match_count);
+                                        break;
+                                    }
+
                                     let tag_name = mat.as_str()[1..].to_string(); // Remove the # prefix
                                     let tag_node_id = (current_line, mat.start());
 
@@ -222,8 +243,16 @@ impl From<String> for Document {
         let lines: Vec<&str> = value.lines().collect();
         let mut i = 0;
 
+        let mut main_loop_count = 0;
         while i < lines.len() {
+            main_loop_count += 1;
+            if main_loop_count > 10000 {
+                eprintln!("EMERGENCY: Main document parsing loop exceeded 10000 iterations");
+                break;
+            }
+
             let line = lines[i];
+            let original_i_for_line = i;
 
             if line.is_empty() {
                 i += 1;
@@ -258,7 +287,15 @@ impl From<String> for Document {
                                 range,
                             },
                         );
+                        let mut heading_loop_count = 0;
+                        let mut heading_processed = false;
                         while let Some(&parent_id) = node_stack.last() {
+                            heading_loop_count += 1;
+                            if heading_loop_count > 100 {
+                                eprintln!("EMERGENCY: Heading hierarchy loop exceeded 100 iterations");
+                                break;
+                            }
+
                             if let Some(parent_node) = nodes.get(&parent_id) {
                                 match parent_node.node_type {
                                     NodeType::Heading(parent_level) => {
@@ -268,6 +305,7 @@ impl From<String> for Document {
                                                 .unwrap()
                                                 .children
                                                 .push(current_node_id);
+                                            heading_processed = true;
                                             break;
                                         } else {
                                             node_stack.pop();
@@ -282,6 +320,10 @@ impl From<String> for Document {
                             }
                         }
 
+                        if !heading_processed {
+                            // If we didn't find a proper parent, just add to root level
+                        }
+
                         node_stack.push(current_node_id);
                         i += 1;
                     }
@@ -291,12 +333,21 @@ impl From<String> for Document {
                         let current_node_id = (paragraph_start, col);
                         let start_line = i;
 
+                        let mut para_boundary_loop_count = 0;
+                        let _original_i = i;
                         while i < lines.len()
                             && !lines[i].is_empty()
                             && !lines[i].trim_start().starts_with('#')
                         {
+                            para_boundary_loop_count += 1;
+                            if para_boundary_loop_count > 1000 {
+                                eprintln!("EMERGENCY: Paragraph boundary loop exceeded 1000 iterations");
+                                break;
+                            }
                             i += 1;
                         }
+
+
 
                         let end_line = if i > 0 { i - 1 } else { 0 };
                         let end_char = if let Some(last_line) = lines.get(end_line) {
@@ -337,6 +388,11 @@ impl From<String> for Document {
                 None => {
                     i += 1;
                 }
+            }
+
+            // Safety: Ensure we always advance i, even if processing failed
+            if i == original_i_for_line {
+                i += 1;
             }
         }
 

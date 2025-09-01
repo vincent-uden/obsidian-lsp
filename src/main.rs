@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::fs;
@@ -17,6 +18,8 @@ use crate::index::{VaultIndex, index_vault};
 
 mod ast;
 mod index;
+mod minimal_test;
+mod comprehensive_test;
 
 #[derive(Debug)]
 struct Backend {
@@ -24,6 +27,8 @@ struct Backend {
     //               Uri     Contents
     doc_map: DashMap<String, Document>,
     vault_index: Arc<RwLock<Option<VaultIndex>>>,
+    last_parse: DashMap<String, Instant>,
+    change_count: DashMap<String, u32>,
 }
 
 impl LanguageServer for Backend {
@@ -45,11 +50,11 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
-                        "[".to_string(),  // For starting links
-                        "#".to_string(),  // For starting tags  
-                        ":".to_string(),  // For properties
-                        "-".to_string(),  // For date links like 2025-07-06
-                        "/".to_string(),  // For folder paths in links
+                        "[".to_string(), // For starting links
+                        "#".to_string(), // For starting tags
+                        ":".to_string(), // For properties
+                        "-".to_string(), // For date links like 2025-07-06
+                        "/".to_string(), // For folder paths in links
                     ]),
                     resolve_provider: Some(false),
                     ..Default::default()
@@ -396,8 +401,31 @@ impl LanguageServer for Backend {
             NodeType::Tag(tag_name) => {
                 debug!("Found tag for hover: {}", tag_name);
 
-                // Get the vault index
-                let vault_index = self.vault_index.read().await;
+                // Simple option to disable tag hover entirely if it causes issues
+                // You can uncomment this line to disable tag hover completely:
+                // return Ok(None);
+
+                // Add safety check for tag name
+                if tag_name.is_empty() || tag_name.len() > 200 {
+                    debug!("Invalid tag name for hover: '{}'", tag_name);
+                    return Ok(None);
+                }
+
+                // Get the vault index with timeout protection
+                let vault_index_result = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    self.vault_index.read(),
+                )
+                .await;
+
+                let vault_index = match vault_index_result {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        debug!("Timeout waiting for vault index lock");
+                        return Ok(None);
+                    }
+                };
+
                 let index = match vault_index.as_ref() {
                     Some(index) => index,
                     None => {
@@ -406,60 +434,88 @@ impl LanguageServer for Backend {
                     }
                 };
 
-                if let Some(files_with_tag) = index.tag_map.get(&tag_name.to_lowercase()) {
-                    let file_count = files_with_tag.len();
-                    let file_list = files_with_tag
-                        .iter()
-                        .take(10)
-                        .map(|path| {
-                            let file_name = path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("Unknown");
-                            format!("- {}", file_name)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                // Safe tag lookup with error handling
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    index.tag_map.get(&tag_name.to_lowercase())
+                })) {
+                    Ok(tag_lookup_result) => {
+                        if let Some(files_with_tag) = tag_lookup_result {
+                            // Safety check for file count
+                            let file_count = files_with_tag.len();
+                            if file_count > 1000 {
+                                debug!(
+                                    "Too many files with tag '{}': {}, limiting display",
+                                    tag_name, file_count
+                                );
+                            }
 
-                    let hover_text = if file_count <= 10 {
-                        format!(
-                            "**Tag: #{}**\n\nFound in {} file{}:\n\n{}",
-                            tag_name,
-                            file_count,
-                            if file_count == 1 { "" } else { "s" },
-                            file_list
-                        )
-                    } else {
-                        format!(
-                            "**Tag: #{}**\n\nFound in {} files (showing first 10):\n\n{}\n\n... and {} more",
-                            tag_name,
-                            file_count,
-                            file_list,
-                            file_count - 10
-                        )
-                    };
+                            // Safely build file list with limits
+                            let file_list = files_with_tag
+                                .iter()
+                                .take(10.min(file_count))
+                                .map(|path| {
+                                    let file_name = path
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("Unknown");
+                                    // Sanitize file name to prevent formatting issues
+                                    let safe_name = file_name.chars().take(100).collect::<String>();
+                                    format!("- {}", safe_name)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
 
-                    let hover_content = MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: hover_text,
-                    };
+                            let hover_text = if file_count <= 10 {
+                                format!(
+                                    "**Tag: #{}**\n\nFound in {} file{}:\n\n{}",
+                                    tag_name,
+                                    file_count,
+                                    if file_count == 1 { "" } else { "s" },
+                                    file_list
+                                )
+                            } else {
+                                format!(
+                                    "**Tag: #{}**\n\nFound in {} files (showing first 10):\n\n{}\n\n... and {} more",
+                                    tag_name,
+                                    file_count,
+                                    file_list,
+                                    file_count - 10
+                                )
+                            };
 
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(hover_content),
-                        range: Some(node.range),
-                    }));
-                } else {
-                    debug!("No files found with tag: {}", tag_name);
+                            let hover_content = MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: hover_text,
+                            };
 
-                    let hover_content = MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: format!("**Tag: #{}**\n\nNo files found with this tag", tag_name),
-                    };
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(hover_content),
+                                range: Some(node.range),
+                            }));
+                        } else {
+                            debug!("No files found with tag: {}", tag_name);
 
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(hover_content),
-                        range: Some(node.range),
-                    }));
+                            let hover_content = MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: format!(
+                                    "**Tag: #{}**\n\nNo files found with this tag",
+                                    tag_name
+                                ),
+                            };
+
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(hover_content),
+                                range: Some(node.range),
+                            }));
+                        }
+                    }
+                    Err(panic_info) => {
+                        debug!(
+                            "Panic during tag lookup for '{}': {:?}",
+                            tag_name, panic_info
+                        );
+                        return Ok(None);
+                    }
                 }
             }
             _ => {
@@ -502,14 +558,14 @@ impl LanguageServer for Backend {
         // Determine completion context and provide appropriate completions
         if let Some(completion_items) = self.provide_completions(&doc, position, index).await {
             debug!("Providing {} completion items", completion_items.len());
-            
+
             // Return incomplete completion list to force client to request fresh completions
             // as the user types more characters instead of doing client-side filtering
             let completion_list = CompletionList {
                 is_incomplete: true, // This forces the client to re-request as user types
                 items: completion_items,
             };
-            
+
             return Ok(Some(CompletionResponse::List(completion_list)));
         }
 
@@ -519,9 +575,62 @@ impl LanguageServer for Backend {
 
 impl Backend {
     async fn on_change(&self, params: TextDocumentItem) {
-        debug!("On change: {params:?}");
-        self.doc_map
-            .insert(params.uri.to_string(), Document::from(params.text));
+        let uri_str = params.uri.to_string();
+
+        // Track change frequency
+        let mut change_count = self.change_count.entry(uri_str.clone()).or_insert(0);
+        *change_count += 1;
+
+        info!(
+            "Document change #{} triggered for: {:?}, version: {:?}",
+            *change_count, params.uri, params.version
+        );
+
+        if *change_count > 100 {
+            warn!(
+                "Excessive document changes detected: {} changes for {}",
+                *change_count, uri_str
+            );
+        }
+
+        info!(
+            "Document content preview (first 100 chars): {:?}",
+            params.text.chars().take(100).collect::<String>()
+        );
+
+        // Rate limiting: Don't re-parse the same document more than once per 100ms
+        let now = Instant::now();
+        if let Some(last_parse_time) = self.last_parse.get(&uri_str) {
+            if now.duration_since(*last_parse_time) < Duration::from_millis(100) {
+                info!(
+                    "Skipping parse due to rate limiting (change #{})",
+                    *change_count
+                );
+                return;
+            }
+        }
+
+        info!("Starting document parsing...");
+        let start_time = Instant::now();
+        let document = Document::from(params.text.clone());
+        let parse_duration = start_time.elapsed();
+
+        info!(
+            "Document parsing completed: {:?} for {} nodes",
+            parse_duration,
+            document.nodes.len()
+        );
+
+        // Log if parsing took unusually long
+        if parse_duration > Duration::from_millis(50) {
+            warn!("Slow document parsing detected: {:?}", parse_duration);
+            warn!("Document length: {} characters", params.text.len());
+        }
+
+        self.last_parse.insert(uri_str.clone(), now);
+        self.doc_map.insert(uri_str, document);
+
+        info!("Document change processing complete");
     }
 
     async fn index_workspace_static(
@@ -672,11 +781,17 @@ impl Backend {
             if link_end.is_none() {
                 // We're inside an incomplete link - extract the partial content
                 let partial_link = &line_before_cursor[link_start + 2..];
-                debug!("Link completion context detected: '[[{}' (cursor at position {})", partial_link, char_idx);
+                debug!(
+                    "Link completion context detected: '[[{}' (cursor at position {})",
+                    partial_link, char_idx
+                );
                 debug!("Full line before cursor: '{}'", line_before_cursor);
                 return Some(self.provide_link_completions(partial_link, index));
             } else {
-                debug!("Complete link found, no completion needed: '{}'", &after_link_start[..link_end.unwrap() + 2]);
+                debug!(
+                    "Complete link found, no completion needed: '{}'",
+                    &after_link_start[..link_end.unwrap() + 2]
+                );
             }
         } else {
             debug!("No [[ found before cursor position");
@@ -701,8 +816,12 @@ impl Backend {
             if line_before_cursor.contains(':') && !line_before_cursor.trim_end().ends_with(':') {
                 // Property value completion - not implemented for now
                 return None;
-            } else if line_before_cursor.trim().is_empty() || 
-                     (!line_before_cursor.contains(':') && line_before_cursor.chars().all(|c| c.is_alphabetic() || c == '-' || c == '_')) {
+            } else if line_before_cursor.trim().is_empty()
+                || (!line_before_cursor.contains(':')
+                    && line_before_cursor
+                        .chars()
+                        .all(|c| c.is_alphabetic() || c == '-' || c == '_'))
+            {
                 // Property key completion
                 let partial_key = line_before_cursor.trim();
                 debug!("Property completion context: '{}'", partial_key);
@@ -716,9 +835,9 @@ impl Backend {
     fn provide_link_completions(&self, partial: &str, index: &VaultIndex) -> Vec<CompletionItem> {
         let mut items = Vec::new();
         let partial_lower = partial.to_lowercase();
-        
+
         debug!("Providing link completions for partial: '{}'", partial);
-        
+
         // Detect if this looks like a date/numeric query
         let is_numeric_query = partial.chars().any(|c| c.is_numeric());
 
@@ -727,48 +846,47 @@ impl Backend {
 
         for entry in index.link_map.iter() {
             let (link_key, file_path) = (entry.key(), entry.value());
-            
+
             // Skip if we've already processed this file
             if seen_files.contains(file_path.as_path()) {
                 continue;
             }
             seen_files.insert(file_path.clone());
-            
+
             let file_stem = file_path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown");
             let file_stem_lower = file_stem.to_lowercase();
-            
+
             // Only match if partial is empty OR if there's a strong match
             let matches = if partial.is_empty() {
                 true
             } else {
                 // For date/numeric queries, be extra strict - require prefix match
                 if is_numeric_query {
-                    file_stem_lower.starts_with(&partial_lower) || 
-                    link_key.starts_with(&partial_lower)
+                    file_stem_lower.starts_with(&partial_lower)
+                        || link_key.starts_with(&partial_lower)
                 } else {
                     // For text queries, allow broader matching
-                    let strong_match = file_stem_lower.starts_with(&partial_lower) || 
-                                     link_key.starts_with(&partial_lower);
-                    
+                    let strong_match = file_stem_lower.starts_with(&partial_lower)
+                        || link_key.starts_with(&partial_lower);
+
                     // Allow contains match only if partial is reasonably long (3+ chars) to avoid spurious matches
-                    let medium_match = partial.len() >= 3 && (
-                        file_stem_lower.contains(&partial_lower) || 
-                        link_key.contains(&partial_lower)
-                    );
-                    
+                    let medium_match = partial.len() >= 3
+                        && (file_stem_lower.contains(&partial_lower)
+                            || link_key.contains(&partial_lower));
+
                     strong_match || medium_match
                 }
             };
-            
+
             if matches {
                 // Determine match quality for better sorting
                 let exact_match = file_stem_lower == partial_lower;
                 let starts_with_match = file_stem_lower.starts_with(&partial_lower);
                 let contains_match = file_stem_lower.contains(&partial_lower);
-                
+
                 // Score for sorting: higher score = better match
                 // Give massive preference to prefix matches for date-like queries
                 let match_score = if exact_match {
@@ -780,9 +898,9 @@ impl Backend {
                 } else {
                     1
                 };
-                
+
                 let detail = format!("→ {}", file_path.display());
-                
+
                 let item = CompletionItem {
                     label: file_stem.to_string(),
                     detail: Some(detail),
@@ -792,24 +910,35 @@ impl Backend {
                     sort_text: Some(format!("{:04}_{}", 10000 - match_score, file_stem)), // Lower sort_text = higher priority
                     ..Default::default()
                 };
-                
+
                 items.push(item);
-                
-                debug!("Added completion item: '{}' (score: {}, exact: {}, starts: {}, contains: {})", 
-                       file_stem, match_score, exact_match, starts_with_match, contains_match);
+
+                debug!(
+                    "Added completion item: '{}' (score: {}, exact: {}, starts: {}, contains: {})",
+                    file_stem, match_score, exact_match, starts_with_match, contains_match
+                );
             } else {
-                debug!("Rejected item: '{}' (key: '{}') - no match for '{}'", file_stem, link_key, partial);
+                debug!(
+                    "Rejected item: '{}' (key: '{}') - no match for '{}'",
+                    file_stem, link_key, partial
+                );
             }
         }
 
         // Sort by match quality (using sort_text which encodes the match score)
         items.sort_by(|a, b| {
-            a.sort_text.as_ref().unwrap_or(&a.label)
+            a.sort_text
+                .as_ref()
+                .unwrap_or(&a.label)
                 .cmp(b.sort_text.as_ref().unwrap_or(&b.label))
         });
 
-        debug!("Returning {} completion items for partial '{}'", items.len(), partial);
-        
+        debug!(
+            "Returning {} completion items for partial '{}'",
+            items.len(),
+            partial
+        );
+
         // For better performance with incomplete responses, limit items based on partial length
         let max_items = if partial.is_empty() {
             20 // Fewer items when showing everything
@@ -818,9 +947,14 @@ impl Backend {
         } else {
             50 // Full set for longer partials
         };
-        
+
         for (i, item) in items.iter().take(10).enumerate() {
-            debug!("  {}. {} (sort: {})", i + 1, item.label, item.sort_text.as_ref().unwrap_or(&"none".to_string()));
+            debug!(
+                "  {}. {} (sort: {})",
+                i + 1,
+                item.label,
+                item.sort_text.as_ref().unwrap_or(&"none".to_string())
+            );
         }
 
         items.truncate(max_items);
@@ -833,10 +967,14 @@ impl Backend {
 
         for entry in index.tag_map.iter() {
             let (tag_name, files) = (entry.key(), entry.value());
-            
+
             if tag_name.contains(&partial_lower) || partial.is_empty() {
-                let detail = format!("Used in {} file{}", files.len(), if files.len() == 1 { "" } else { "s" });
-                
+                let detail = format!(
+                    "Used in {} file{}",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" }
+                );
+
                 items.push(CompletionItem {
                     label: format!("#{}", tag_name),
                     detail: Some(detail),
@@ -851,9 +989,17 @@ impl Backend {
         items.sort_by(|a, b| {
             let a_key = a.insert_text.as_ref().unwrap_or(&a.label);
             let b_key = b.insert_text.as_ref().unwrap_or(&b.label);
-            let a_count = index.tag_map.get(a_key.as_str()).map(|v| v.len()).unwrap_or(0);
-            let b_count = index.tag_map.get(b_key.as_str()).map(|v| v.len()).unwrap_or(0);
-            
+            let a_count = index
+                .tag_map
+                .get(a_key.as_str())
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let b_count = index
+                .tag_map
+                .get(b_key.as_str())
+                .map(|v| v.len())
+                .unwrap_or(0);
+
             match b_count.cmp(&a_count) {
                 std::cmp::Ordering::Equal => a.label.cmp(&b.label),
                 other => other,
@@ -864,7 +1010,11 @@ impl Backend {
         items
     }
 
-    fn provide_property_completions(&self, partial: &str, index: &VaultIndex) -> Vec<CompletionItem> {
+    fn provide_property_completions(
+        &self,
+        partial: &str,
+        index: &VaultIndex,
+    ) -> Vec<CompletionItem> {
         let mut items = Vec::new();
         let partial_lower = partial.to_lowercase();
 
@@ -896,11 +1046,18 @@ impl Backend {
         // Add properties found in vault
         for entry in index.property_map.iter() {
             let (prop_name, files) = (entry.key(), entry.value());
-            
+
             if prop_name.contains(&partial_lower) || partial.is_empty() {
-                if !common_properties.iter().any(|(common, _)| common == prop_name) {
-                    let detail = format!("Used in {} file{}", files.len(), if files.len() == 1 { "" } else { "s" });
-                    
+                if !common_properties
+                    .iter()
+                    .any(|(common, _)| common == prop_name)
+                {
+                    let detail = format!(
+                        "Used in {} file{}",
+                        files.len(),
+                        if files.len() == 1 { "" } else { "s" }
+                    );
+
                     items.push(CompletionItem {
                         label: prop_name.to_string(),
                         detail: Some(detail),
@@ -920,7 +1077,7 @@ impl Backend {
 
     fn is_in_frontmatter(&self, doc: &Document, line_idx: usize) -> bool {
         let lines: Vec<&str> = doc.contents.lines().collect();
-        
+
         if lines.is_empty() || !lines[0].trim().starts_with("---") {
             return false;
         }
@@ -931,7 +1088,7 @@ impl Backend {
                 return line_idx > 0 && line_idx < idx;
             }
         }
-        
+
         false
     }
 }
@@ -1062,41 +1219,54 @@ mod tests {
         // Test link completion context detection by checking string patterns
         let line = "This is a test with [[partial";
         let position = 29; // After "[[partial"
-        
+
         // Simulate the context detection logic
         let line_before_cursor = &line[..position.min(line.len())];
         if let Some(link_start) = line_before_cursor.rfind("[[") {
             let link_end = line_before_cursor[link_start..].find("]]");
             assert!(link_end.is_none(), "Should detect incomplete link context");
-            
+
             let partial_link = &line_before_cursor[link_start + 2..];
             assert_eq!(partial_link, "partial", "Should extract partial link text");
         }
-        
+
         // Test with date-like patterns (the reported issue)
         let date_line = "Today I will write [[2025-07-06";
         let date_position = 32; // After "[[2025-07-06"
-        
+
         let date_line_before_cursor = &date_line[..date_position.min(date_line.len())];
         if let Some(link_start) = date_line_before_cursor.rfind("[[") {
             let link_end = date_line_before_cursor[link_start..].find("]]");
-            assert!(link_end.is_none(), "Should detect incomplete date link context");
-            
+            assert!(
+                link_end.is_none(),
+                "Should detect incomplete date link context"
+            );
+
             let partial_date_link = &date_line_before_cursor[link_start + 2..];
-            assert_eq!(partial_date_link, "2025-07-06", "Should extract partial date link text including dashes");
+            assert_eq!(
+                partial_date_link, "2025-07-06",
+                "Should extract partial date link text including dashes"
+            );
         }
-        
+
         // Test partial date with just one dash
         let partial_date_line = "Today I will write [[2025-";
         let partial_date_position = 27; // After "[[2025-"
-        
-        let partial_date_line_before_cursor = &partial_date_line[..partial_date_position.min(partial_date_line.len())];
+
+        let partial_date_line_before_cursor =
+            &partial_date_line[..partial_date_position.min(partial_date_line.len())];
         if let Some(link_start) = partial_date_line_before_cursor.rfind("[[") {
             let link_end = partial_date_line_before_cursor[link_start..].find("]]");
-            assert!(link_end.is_none(), "Should detect incomplete partial date link context");
-            
+            assert!(
+                link_end.is_none(),
+                "Should detect incomplete partial date link context"
+            );
+
             let partial_with_dash = &partial_date_line_before_cursor[link_start + 2..];
-            assert_eq!(partial_with_dash, "2025-", "Should extract partial date including trailing dash");
+            assert_eq!(
+                partial_with_dash, "2025-",
+                "Should extract partial date including trailing dash"
+            );
         }
     }
 
@@ -1105,12 +1275,12 @@ mod tests {
         // Test tag completion context detection
         let line = "This is a test with #parti";
         let position = 26; // After "#parti"
-        
+
         let line_before_cursor = &line[..position.min(line.len())];
         if let Some(tag_start) = line_before_cursor.rfind('#') {
             let before_hash = &line_before_cursor[..tag_start];
             assert!(!before_hash.contains("http"), "Should not be part of URL");
-            
+
             let after_hash = &line_before_cursor[tag_start + 1..];
             assert_eq!(after_hash, "parti", "Should extract partial tag text");
         }
@@ -1122,13 +1292,16 @@ mod tests {
         let content = "---\ntitle: Test\nauth\n---\n# Content";
         let lines: Vec<&str> = content.lines().collect();
         let line_idx = 2; // "auth" line
-        
+
         // Simulate is_in_frontmatter logic
         if !lines.is_empty() && lines[0].trim().starts_with("---") {
             for (idx, line) in lines.iter().enumerate().skip(1) {
                 if line.trim() == "---" {
                     let is_in_frontmatter = line_idx > 0 && line_idx < idx;
-                    assert!(is_in_frontmatter, "Line 2 should be detected as in frontmatter");
+                    assert!(
+                        is_in_frontmatter,
+                        "Line 2 should be detected as in frontmatter"
+                    );
                     break;
                 }
             }
@@ -1145,24 +1318,45 @@ mod tests {
 
         // Test link completion logic
         let link_index = VaultIndex::new();
-        link_index.link_map.insert("test-file".to_string(), PathBuf::from("/test/test-file.md"));
-        link_index.link_map.insert("another-test".to_string(), PathBuf::from("/test/another-test.md"));
-        
+        link_index
+            .link_map
+            .insert("test-file".to_string(), PathBuf::from("/test/test-file.md"));
+        link_index.link_map.insert(
+            "another-test".to_string(),
+            PathBuf::from("/test/another-test.md"),
+        );
+
         // Verify we have the expected data in our index
         assert_eq!(link_index.link_map.len(), 2, "Should have 2 link entries");
 
-        // Test tag completion logic  
+        // Test tag completion logic
         let tag_index = VaultIndex::new();
-        tag_index.tag_map.insert("programming".to_string(), vec![PathBuf::from("/test/file1.md")]);
-        tag_index.tag_map.insert("rust".to_string(), vec![PathBuf::from("/test/file1.md"), PathBuf::from("/test/file2.md")]);
-        
+        tag_index.tag_map.insert(
+            "programming".to_string(),
+            vec![PathBuf::from("/test/file1.md")],
+        );
+        tag_index.tag_map.insert(
+            "rust".to_string(),
+            vec![
+                PathBuf::from("/test/file1.md"),
+                PathBuf::from("/test/file2.md"),
+            ],
+        );
+
         assert_eq!(tag_index.tag_map.len(), 2, "Should have 2 tag entries");
 
         // Test property completion logic
         let prop_index = VaultIndex::new();
-        prop_index.property_map.insert("custom-property".to_string(), vec![PathBuf::from("/test/file1.md")]);
-        
-        assert_eq!(prop_index.property_map.len(), 1, "Should have 1 property entry");
+        prop_index.property_map.insert(
+            "custom-property".to_string(),
+            vec![PathBuf::from("/test/file1.md")],
+        );
+
+        assert_eq!(
+            prop_index.property_map.len(),
+            1,
+            "Should have 1 property entry"
+        );
 
         println!("Basic completion provider data structures validated");
     }
@@ -1173,20 +1367,20 @@ mod tests {
         let partial = "2025";
         let candidates = vec![
             ("2025-01-01", "/notes/2025-01-01.md"),
-            ("2025-01-15", "/notes/2025-01-15.md"), 
+            ("2025-01-15", "/notes/2025-01-15.md"),
             ("2025-07-06", "/notes/2025-07-06.md"),
             ("2024-11-05", "/notes/2024-11-05.md"), // Should NOT match "2025"
             ("my-note", "/notes/my-note.md"),
         ];
-        
+
         // Simulate the improved matching logic
         let partial_lower = partial.to_lowercase();
         let is_numeric_query = partial.chars().any(|c| c.is_numeric());
         let mut scored_items: Vec<(i32, &str)> = Vec::new();
-        
+
         for (file_stem, _path) in &candidates {
             let file_stem_lower = file_stem.to_lowercase();
-            
+
             // Apply the new strict matching logic for numeric queries
             let matches = if is_numeric_query {
                 // For numeric queries, require prefix match
@@ -1197,12 +1391,12 @@ mod tests {
                 let medium_match = partial.len() >= 3 && file_stem_lower.contains(&partial_lower);
                 strong_match || medium_match
             };
-            
+
             if matches {
                 let exact_match = file_stem_lower == partial_lower;
                 let starts_with_match = file_stem_lower.starts_with(&partial_lower);
                 let contains_match = file_stem_lower.contains(&partial_lower);
-                
+
                 let match_score = if exact_match {
                     10000
                 } else if starts_with_match {
@@ -1212,47 +1406,99 @@ mod tests {
                 } else {
                     1
                 };
-                
+
                 scored_items.push((match_score, file_stem));
             }
         }
-        
+
         // Sort by score (descending)
         scored_items.sort_by(|a, b| b.0.cmp(&a.0));
-        
-        println!("Scored results for '{}' (numeric_query={}): {:?}", partial, is_numeric_query, scored_items);
-        
+
+        println!(
+            "Scored results for '{}' (numeric_query={}): {:?}",
+            partial, is_numeric_query, scored_items
+        );
+
         // For numeric query "2025", should ONLY get 2025 files, NO 2024 files
         let sorted_names: Vec<&str> = scored_items.iter().map(|(_, name)| *name).collect();
-        
+
         // Should have 3 results (all the 2025 files)
-        assert_eq!(sorted_names.len(), 3, "Should have exactly 3 matches for '2025', got: {:?}", sorted_names);
-        
+        assert_eq!(
+            sorted_names.len(),
+            3,
+            "Should have exactly 3 matches for '2025', got: {:?}",
+            sorted_names
+        );
+
         // All results should start with "2025"
         for name in &sorted_names {
-            assert!(name.starts_with("2025"), "All results should start with '2025', got: {}", name);
+            assert!(
+                name.starts_with("2025"),
+                "All results should start with '2025', got: {}",
+                name
+            );
         }
-        
+
         // Should NOT contain any 2024 files
-        assert!(!sorted_names.iter().any(|name| name.contains("2024")), 
-                "Should not contain any 2024 files when searching for '2025', got: {:?}", sorted_names);
-        
+        assert!(
+            !sorted_names.iter().any(|name| name.contains("2024")),
+            "Should not contain any 2024 files when searching for '2025', got: {:?}",
+            sorted_names
+        );
+
         // The first result should be one of the 2025 files
-        assert!(sorted_names[0].starts_with("2025"), "First result should start with '2025', got: {}", sorted_names[0]);
+        assert!(
+            sorted_names[0].starts_with("2025"),
+            "First result should start with '2025', got: {}",
+            sorted_names[0]
+        );
     }
 
-    #[test]  
+    #[test]
+    fn test_nested_tag_parsing() {
+        // Test that the problematic nested tag format gets parsed correctly
+        let doc_content = "This document has a nested tag: #Area/components/erf1002 in the middle.";
+        let doc = ast::Document::from(doc_content.to_string());
+
+        // Find the tag node
+        let tag_nodes: Vec<_> = doc
+            .nodes
+            .values()
+            .filter_map(|node| match &node.node_type {
+                ast::NodeType::Tag(tag_name) => Some(tag_name),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tag_nodes.len(), 1, "Should find exactly one tag");
+        assert_eq!(
+            tag_nodes[0], "Area/components/erf1002",
+            "Should correctly parse nested tag format"
+        );
+
+        // Verify the tag name is safe for processing (no empty, not too long)
+        let tag_name = tag_nodes[0];
+        assert!(!tag_name.is_empty(), "Tag name should not be empty");
+        assert!(
+            tag_name.len() <= 200,
+            "Tag name should not be excessively long"
+        );
+
+        println!("✓ Nested tag parsed safely: '{}'", tag_name);
+    }
+
+    #[test]
     fn test_fuzzy_match_prevention() {
         // Test that we prevent the specific issue reported: "2024-11-05" matching "2025"
         // where LSP client finds fuzzy matches like "202" and "5" in "2024-11-05"
-        
+
         let partial = "2025";
         let problem_file = "2024-11-05"; // This should NOT match
         let correct_file = "2025-01-01"; // This SHOULD match
-        
+
         let partial_lower = partial.to_lowercase();
         let is_numeric_query = partial.chars().any(|c| c.is_numeric());
-        
+
         // Test problem file
         let problem_file_lower = problem_file.to_lowercase();
         let problem_matches = if is_numeric_query {
@@ -1260,19 +1506,24 @@ mod tests {
         } else {
             problem_file_lower.contains(&partial_lower)
         };
-        
-        // Test correct file  
+
+        // Test correct file
         let correct_file_lower = correct_file.to_lowercase();
         let correct_matches = if is_numeric_query {
             correct_file_lower.starts_with(&partial_lower)
         } else {
             correct_file_lower.contains(&partial_lower)
         };
-        
-        assert!(!problem_matches, "2024-11-05 should NOT match query '2025' with strict numeric matching");
+
+        assert!(
+            !problem_matches,
+            "2024-11-05 should NOT match query '2025' with strict numeric matching"
+        );
         assert!(correct_matches, "2025-01-01 SHOULD match query '2025'");
-        
-        println!("✓ Fuzzy match prevention working: '2025' correctly excludes '2024-11-05' and includes '2025-01-01'");
+
+        println!(
+            "✓ Fuzzy match prevention working: '2025' correctly excludes '2024-11-05' and includes '2025-01-01'"
+        );
     }
 
     #[test]
@@ -1281,7 +1532,7 @@ mod tests {
         let doc_content = "---\ntitle: Test\nauthor: Me\n---\n# Content";
         let lines: Vec<&str> = doc_content.lines().collect();
 
-        // Simulate frontmatter detection logic 
+        // Simulate frontmatter detection logic
         let has_frontmatter = !lines.is_empty() && lines[0].trim().starts_with("---");
         assert!(has_frontmatter, "Should detect frontmatter start");
 
@@ -1293,8 +1544,12 @@ mod tests {
                 break;
             }
         }
-        
-        assert_eq!(frontmatter_end, Some(3), "Should find frontmatter end at line 3");
+
+        assert_eq!(
+            frontmatter_end,
+            Some(3),
+            "Should find frontmatter end at line 3"
+        );
 
         // Test lines within frontmatter
         let line_1_in_fm = 1 > 0 && 1 < 3; // title line
@@ -1305,8 +1560,6 @@ mod tests {
         assert!(line_2_in_fm, "Line 2 should be in frontmatter");
         assert!(!line_4_in_fm, "Line 4 should not be in frontmatter");
     }
-
-
 }
 
 #[tokio::main]
@@ -1326,6 +1579,8 @@ async fn main() {
         client,
         doc_map: DashMap::new(),
         vault_index: Arc::new(RwLock::new(None)),
+        last_parse: DashMap::new(),
+        change_count: DashMap::new(),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
