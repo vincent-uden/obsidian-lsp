@@ -9,6 +9,14 @@ A Language Server Protocol (LSP) implementation for Obsidian markdown files, pro
 cargo install obsidian-lsp
 ```
 
+### Via cargo-binstall (Fast binary installation)
+```bash
+cargo binstall obsidian-lsp
+```
+
+### Pre-built binaries
+Download the latest release from [GitHub Releases](https://github.com/vincent-uden/obsidian-lsp/releases) for your platform.
+
 ### From Source
 ```bash
 git clone https://github.com/vincent-uden/obsidian-lsp
