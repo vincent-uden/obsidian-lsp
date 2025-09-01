@@ -259,6 +259,26 @@ impl LanguageServer for Backend {
                             symbols.push(link_symbol);
                         }
                     }
+                    ast::NodeType::Tag(tag_name) => {
+                        let tag_symbol = DocumentSymbol {
+                            name: format!("#{}", tag_name),
+                            detail: Some("tag".to_string()),
+                            kind: SymbolKind::KEY,
+                            tags: None,
+                            deprecated: None,
+                            range: node.range,
+                            selection_range: node.range,
+                            children: None,
+                        };
+                        if let Some(current_heading) = stack.last_mut() {
+                            if current_heading.children.is_none() {
+                                current_heading.children = Some(vec![]);
+                            }
+                            current_heading.children.as_mut().unwrap().push(tag_symbol);
+                        } else {
+                            symbols.push(tag_symbol);
+                        }
+                    }
                     _ => {} // Skip paragraphs
                 }
             }
@@ -302,7 +322,6 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Find the node at the cursor position
         let node = match self.find_node_at_position(&doc, position) {
             Some(node) => node,
             None => {
@@ -311,35 +330,102 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Check if it's a link node
-        if let NodeType::Link(link) = &node.node_type {
-            debug!("Found link for hover: {}", link.address);
+        match &node.node_type {
+            NodeType::Link(link) => {
+                debug!("Found link for hover: {}", link.address);
 
-            // Get the vault index
-            let vault_index = self.vault_index.read().await;
-            let index = match vault_index.as_ref() {
-                Some(index) => index,
-                None => {
-                    debug!("Vault index not available for hover");
-                    return Ok(None);
+                let vault_index = self.vault_index.read().await;
+                let index = match vault_index.as_ref() {
+                    Some(index) => index,
+                    None => {
+                        debug!("Vault index not available for hover");
+                        return Ok(None);
+                    }
+                };
+
+                if let Some(target_path) = index.find_file(&link.address) {
+                    debug!("Found target file for hover: {}", target_path.display());
+
+                    if let Ok(preview_content) = self.create_file_preview(&target_path).await {
+                        let file_name = target_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("Unknown");
+
+                        let hover_text = format!(
+                            "**{}** *({})*\n\n{}",
+                            link.display_text, file_name, preview_content
+                        );
+
+                        let hover_content = MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: hover_text,
+                        };
+
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(hover_content),
+                            range: Some(node.range),
+                        }));
+                    }
+                } else {
+                    debug!("Target file not found for hover link: {}", link.address);
+
+                    let hover_content = MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format!("**File not found**: `{}`", link.address),
+                    };
+
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(hover_content),
+                        range: Some(node.range),
+                    }));
                 }
-            };
+            }
+            NodeType::Tag(tag_name) => {
+                debug!("Found tag for hover: {}", tag_name);
 
-            // Find the target file
-            if let Some(target_path) = index.find_file(&link.address) {
-                debug!("Found target file for hover: {}", target_path.display());
+                // Get the vault index
+                let vault_index = self.vault_index.read().await;
+                let index = match vault_index.as_ref() {
+                    Some(index) => index,
+                    None => {
+                        debug!("Vault index not available for hover");
+                        return Ok(None);
+                    }
+                };
 
-                // Read and preview the file content
-                if let Ok(preview_content) = self.create_file_preview(&target_path).await {
-                    let file_name = target_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("Unknown");
+                if let Some(files_with_tag) = index.tag_map.get(&tag_name.to_lowercase()) {
+                    let file_count = files_with_tag.len();
+                    let file_list = files_with_tag
+                        .iter()
+                        .take(10)
+                        .map(|path| {
+                            let file_name = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("Unknown");
+                            format!("- {}", file_name)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
 
-                    let hover_text = format!(
-                        "**{}** *({})*\n\n{}",
-                        link.display_text, file_name, preview_content
-                    );
+                    let hover_text = if file_count <= 10 {
+                        format!(
+                            "**Tag: #{}**\n\nFound in {} file{}:\n\n{}",
+                            tag_name,
+                            file_count,
+                            if file_count == 1 { "" } else { "s" },
+                            file_list
+                        )
+                    } else {
+                        format!(
+                            "**Tag: #{}**\n\nFound in {} files (showing first 10):\n\n{}\n\n... and {} more",
+                            tag_name,
+                            file_count,
+                            file_list,
+                            file_count - 10
+                        )
+                    };
 
                     let hover_content = MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -350,23 +436,26 @@ impl LanguageServer for Backend {
                         contents: HoverContents::Markup(hover_content),
                         range: Some(node.range),
                     }));
+                } else {
+                    debug!("No files found with tag: {}", tag_name);
+
+                    let hover_content = MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format!("**Tag: #{}**\n\nNo files found with this tag", tag_name),
+                    };
+
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(hover_content),
+                        range: Some(node.range),
+                    }));
                 }
-            } else {
-                debug!("Target file not found for hover link: {}", link.address);
-
-                // Show "file not found" message
-                let hover_content = MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("**File not found**: `{}`", link.address),
-                };
-
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(hover_content),
-                    range: Some(node.range),
-                }));
             }
-        } else {
-            debug!("Node at hover position is not a link: {:?}", node.node_type);
+            _ => {
+                debug!(
+                    "Node at hover position is not a link or tag: {:?}",
+                    node.node_type
+                );
+            }
         }
 
         Ok(None)
@@ -407,21 +496,19 @@ impl Backend {
     fn find_node_at_position<'a>(&self, doc: &'a Document, position: Position) -> Option<&'a Node> {
         let mut matching_nodes = Vec::new();
 
-        // Find all nodes that contain the position
         for node in doc.nodes.values() {
             if position_in_range(position, node.range) {
                 matching_nodes.push(node);
             }
         }
 
-        // Prioritize link nodes over other types
+        // Prioritize link and tag nodes over other types
         for node in &matching_nodes {
-            if matches!(node.node_type, NodeType::Link(_)) {
+            if matches!(node.node_type, NodeType::Link(_) | NodeType::Tag(_)) {
                 return Some(node);
             }
         }
 
-        // If no link node found, return the first match (could be paragraph/heading)
         matching_nodes.first().copied()
     }
 
@@ -431,7 +518,6 @@ impl Backend {
     ) -> std::result::Result<String, std::io::Error> {
         let content = fs::read_to_string(file_path).await?;
 
-        // Extract preview content based on file type
         let preview = if file_path.extension().and_then(|s| s.to_str()) == Some("md") {
             self.extract_markdown_preview(&content)
         } else {

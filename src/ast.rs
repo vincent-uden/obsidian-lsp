@@ -14,6 +14,7 @@ pub enum NodeType {
     Heading(usize),
     Paragraph,
     Link(Link),
+    Tag(String),
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +51,12 @@ fn parse_wiki_link_text(link_text: &str) -> (String, String) {
 
 impl Document {
     fn extract_wiki_links(&mut self) {
+        self.extract_links_and_tags();
+    }
+
+    fn extract_links_and_tags(&mut self) {
         let wiki_regex = Regex::new(r"\[\[([^\]]+)\]\]").unwrap();
+        let tag_regex = Regex::new(r"#([a-zA-Z][a-zA-Z0-9_/-]*)").unwrap();
         let lines: Vec<&str> = self.contents.lines().collect();
         let mut additional_nodes = HashMap::new();
 
@@ -96,6 +102,35 @@ impl Document {
                                     parent_node.children.push(link_node_id);
                                 }
                             }
+
+                            for mat in tag_regex.find_iter(line) {
+                                let tag_name = mat.as_str()[1..].to_string(); // Remove the # prefix
+                                let tag_node_id = (line_num, mat.start());
+
+                                let range = Range {
+                                    start: Position {
+                                        line: line_num as u32,
+                                        character: mat.start() as u32,
+                                    },
+                                    end: Position {
+                                        line: line_num as u32,
+                                        character: mat.end() as u32,
+                                    },
+                                };
+
+                                additional_nodes.insert(
+                                    tag_node_id,
+                                    Node {
+                                        node_type: NodeType::Tag(tag_name),
+                                        children: vec![],
+                                        range,
+                                    },
+                                );
+
+                                if let Some(parent_node) = self.nodes.get_mut(&node_id) {
+                                    parent_node.children.push(tag_node_id);
+                                }
+                            }
                         }
                     }
                     NodeType::Paragraph => {
@@ -136,6 +171,35 @@ impl Document {
 
                                     if let Some(parent_node) = self.nodes.get_mut(&node_id) {
                                         parent_node.children.push(link_node_id);
+                                    }
+                                }
+
+                                for mat in tag_regex.find_iter(line) {
+                                    let tag_name = mat.as_str()[1..].to_string(); // Remove the # prefix
+                                    let tag_node_id = (current_line, mat.start());
+
+                                    let range = Range {
+                                        start: Position {
+                                            line: current_line as u32,
+                                            character: mat.start() as u32,
+                                        },
+                                        end: Position {
+                                            line: current_line as u32,
+                                            character: mat.end() as u32,
+                                        },
+                                    };
+
+                                    additional_nodes.insert(
+                                        tag_node_id,
+                                        Node {
+                                            node_type: NodeType::Tag(tag_name),
+                                            children: vec![],
+                                            range,
+                                        },
+                                    );
+
+                                    if let Some(parent_node) = self.nodes.get_mut(&node_id) {
+                                        parent_node.children.push(tag_node_id);
                                     }
                                 }
                             }
@@ -519,6 +583,38 @@ End of document."#;
             .find(|link| link.address == "complex/path")
             .expect("Should find complex/path link");
         assert_eq!(complex_link.display_text, "Simplified Name");
+    }
+
+    #[test]
+    fn test_parse_tags() {
+        let src = include_str!("../assets/tests/tags.md");
+        let doc: Document = src.to_string().into();
+
+        // Find all tag nodes
+        let tag_nodes: Vec<_> = doc
+            .nodes
+            .values()
+            .filter_map(|node| match &node.node_type {
+                NodeType::Tag(tag_name) => Some(tag_name),
+                _ => None,
+            })
+            .collect();
+
+        // Should have inline tags: inline-tag, programming, rust, lsp, test, example, demo, final-tag
+        assert!(
+            tag_nodes.len() >= 8,
+            "Expected at least 8 tag nodes, got {}",
+            tag_nodes.len()
+        );
+
+        assert!(tag_nodes.contains(&&"inline-tag".to_string()));
+        assert!(tag_nodes.contains(&&"programming".to_string()));
+        assert!(tag_nodes.contains(&&"rust".to_string()));
+        assert!(tag_nodes.contains(&&"lsp".to_string()));
+        assert!(tag_nodes.contains(&&"test".to_string()));
+        assert!(tag_nodes.contains(&&"example".to_string()));
+        assert!(tag_nodes.contains(&&"demo".to_string()));
+        assert!(tag_nodes.contains(&&"final-tag".to_string()));
     }
 
     #[test]
