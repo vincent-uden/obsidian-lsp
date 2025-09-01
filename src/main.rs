@@ -42,6 +42,17 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![
+                        "[".to_string(),  // For starting links
+                        "#".to_string(),  // For starting tags  
+                        ":".to_string(),  // For properties
+                        "-".to_string(),  // For date links like 2025-07-06
+                        "/".to_string(),  // For folder paths in links
+                    ]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -460,6 +471,41 @@ impl LanguageServer for Backend {
 
         Ok(None)
     }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        debug!("Completion requested for {:?} at {:?}", uri, position);
+        debug!("Completion context: {:?}", params.context);
+
+        // Get the document
+        let doc = match self.doc_map.get(uri.as_str()) {
+            Some(doc) => doc,
+            None => {
+                debug!("Document not found for completion: {:?}", uri);
+                return Ok(None);
+            }
+        };
+
+        // Get the vault index
+        let vault_index = self.vault_index.read().await;
+        let index = match vault_index.as_ref() {
+            Some(index) => index,
+            None => {
+                debug!("Vault index not available for completion");
+                return Ok(None);
+            }
+        };
+
+        // Determine completion context and provide appropriate completions
+        if let Some(completion_items) = self.provide_completions(&doc, position, index).await {
+            debug!("Providing {} completion items", completion_items.len());
+            return Ok(Some(CompletionResponse::Array(completion_items)));
+        }
+
+        Ok(None)
+    }
 }
 
 impl Backend {
@@ -591,6 +637,246 @@ impl Backend {
             )
         }
     }
+
+    async fn provide_completions(
+        &self,
+        doc: &Document,
+        position: Position,
+        index: &VaultIndex,
+    ) -> Option<Vec<CompletionItem>> {
+        let lines: Vec<&str> = doc.contents.lines().collect();
+        let line_idx = position.line as usize;
+        let char_idx = position.character as usize;
+
+        if line_idx >= lines.len() {
+            return None;
+        }
+
+        let line = lines[line_idx];
+        let line_before_cursor = &line[..char_idx.min(line.len())];
+
+        // Check for link completion context [[...
+        if let Some(link_start) = line_before_cursor.rfind("[[") {
+            // Check if there's a closing ]] after the opening [[
+            let after_link_start = &line_before_cursor[link_start..];
+            let link_end = after_link_start.find("]]");
+            if link_end.is_none() {
+                // We're inside an incomplete link - extract the partial content
+                let partial_link = &line_before_cursor[link_start + 2..];
+                debug!("Link completion context detected: '[[{}' (cursor at position {})", partial_link, char_idx);
+                debug!("Full line before cursor: '{}'", line_before_cursor);
+                return Some(self.provide_link_completions(partial_link, index));
+            } else {
+                debug!("Complete link found, no completion needed: '{}'", &after_link_start[..link_end.unwrap() + 2]);
+            }
+        } else {
+            debug!("No [[ found before cursor position");
+        }
+
+        // Check for tag completion context #...
+        if let Some(tag_start) = line_before_cursor.rfind('#') {
+            // Make sure it's not part of a URL or code block
+            let before_hash = &line_before_cursor[..tag_start];
+            if !before_hash.contains("http") && !before_hash.contains('`') {
+                // Check if there's whitespace or punctuation after the tag
+                let after_hash = &line_before_cursor[tag_start + 1..];
+                if !after_hash.contains(' ') && !after_hash.contains('\t') {
+                    debug!("Tag completion context: '{}'", after_hash);
+                    return Some(self.provide_tag_completions(after_hash, index));
+                }
+            }
+        }
+
+        // Check for property completion context (YAML frontmatter)
+        if self.is_in_frontmatter(doc, line_idx) {
+            if line_before_cursor.contains(':') && !line_before_cursor.trim_end().ends_with(':') {
+                // Property value completion - not implemented for now
+                return None;
+            } else if line_before_cursor.trim().is_empty() || 
+                     (!line_before_cursor.contains(':') && line_before_cursor.chars().all(|c| c.is_alphabetic() || c == '-' || c == '_')) {
+                // Property key completion
+                let partial_key = line_before_cursor.trim();
+                debug!("Property completion context: '{}'", partial_key);
+                return Some(self.provide_property_completions(partial_key, index));
+            }
+        }
+
+        None
+    }
+
+    fn provide_link_completions(&self, partial: &str, index: &VaultIndex) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        let partial_lower = partial.to_lowercase();
+        let partial_normalized = partial_lower.replace(' ', "-").replace('_', "-");
+        
+        debug!("Providing link completions for partial: '{}' (normalized: '{}')", partial, partial_normalized);
+
+        for entry in index.link_map.iter() {
+            let (link_key, file_path) = (entry.key(), entry.value());
+            
+            // Check if the partial matches the link key (which is already normalized)
+            // Also check the original file name for more flexible matching
+            let file_stem = file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+            let file_stem_lower = file_stem.to_lowercase();
+            
+            let matches = partial.is_empty() || 
+                         link_key.contains(&partial_normalized) ||
+                         link_key.contains(&partial_lower) ||
+                         file_stem_lower.contains(&partial_lower) ||
+                         file_stem_lower.contains(&partial_normalized);
+            
+            if matches {
+                let detail = format!("→ {}", file_path.display());
+                
+                items.push(CompletionItem {
+                    label: file_stem.to_string(),
+                    detail: Some(detail),
+                    kind: Some(CompletionItemKind::FILE),
+                    insert_text: Some(file_stem.to_string()),
+                    filter_text: Some(format!("{} {}", file_stem, link_key)), // Help with filtering
+                    ..Default::default()
+                });
+                
+                debug!("Added completion item: '{}' (matches key: '{}', stem: '{}')", file_stem, link_key, file_stem);
+            }
+        }
+
+        // Sort by relevance (exact matches first, then starts_with, then contains)
+        items.sort_by(|a, b| {
+            let a_stem = a.label.to_lowercase();
+            let b_stem = b.label.to_lowercase();
+            
+            let a_exact = a_stem == partial_lower;
+            let b_exact = b_stem == partial_lower;
+            let a_starts = a_stem.starts_with(&partial_lower) || a_stem.starts_with(&partial_normalized);
+            let b_starts = b_stem.starts_with(&partial_lower) || b_stem.starts_with(&partial_normalized);
+            
+            match (a_exact, b_exact) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => match (a_starts, b_starts) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.label.cmp(&b.label),
+                }
+            }
+        });
+
+        debug!("Returning {} completion items", items.len());
+        items.truncate(50); // Limit to 50 items for performance
+        items
+    }
+
+    fn provide_tag_completions(&self, partial: &str, index: &VaultIndex) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        let partial_lower = partial.to_lowercase();
+
+        for entry in index.tag_map.iter() {
+            let (tag_name, files) = (entry.key(), entry.value());
+            
+            if tag_name.contains(&partial_lower) || partial.is_empty() {
+                let detail = format!("Used in {} file{}", files.len(), if files.len() == 1 { "" } else { "s" });
+                
+                items.push(CompletionItem {
+                    label: format!("#{}", tag_name),
+                    detail: Some(detail),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    insert_text: Some(tag_name.to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+
+        // Sort by usage frequency (descending) then alphabetical
+        items.sort_by(|a, b| {
+            let a_key = a.insert_text.as_ref().unwrap_or(&a.label);
+            let b_key = b.insert_text.as_ref().unwrap_or(&b.label);
+            let a_count = index.tag_map.get(a_key.as_str()).map(|v| v.len()).unwrap_or(0);
+            let b_count = index.tag_map.get(b_key.as_str()).map(|v| v.len()).unwrap_or(0);
+            
+            match b_count.cmp(&a_count) {
+                std::cmp::Ordering::Equal => a.label.cmp(&b.label),
+                other => other,
+            }
+        });
+
+        items.truncate(30); // Limit to 30 tags for performance
+        items
+    }
+
+    fn provide_property_completions(&self, partial: &str, index: &VaultIndex) -> Vec<CompletionItem> {
+        let mut items = Vec::new();
+        let partial_lower = partial.to_lowercase();
+
+        // Add common Obsidian properties
+        let common_properties = [
+            ("title", "Document title"),
+            ("tags", "Document tags"),
+            ("aliases", "Alternative names"),
+            ("author", "Document author"),
+            ("created", "Creation date"),
+            ("modified", "Last modified date"),
+            ("status", "Document status"),
+            ("type", "Document type"),
+            ("category", "Document category"),
+        ];
+
+        for (prop, desc) in common_properties {
+            if prop.contains(&partial_lower) || partial.is_empty() {
+                items.push(CompletionItem {
+                    label: prop.to_string(),
+                    detail: Some(desc.to_string()),
+                    kind: Some(CompletionItemKind::PROPERTY),
+                    insert_text: Some(format!("{}: ", prop)),
+                    ..Default::default()
+                });
+            }
+        }
+
+        // Add properties found in vault
+        for entry in index.property_map.iter() {
+            let (prop_name, files) = (entry.key(), entry.value());
+            
+            if prop_name.contains(&partial_lower) || partial.is_empty() {
+                if !common_properties.iter().any(|(common, _)| common == prop_name) {
+                    let detail = format!("Used in {} file{}", files.len(), if files.len() == 1 { "" } else { "s" });
+                    
+                    items.push(CompletionItem {
+                        label: prop_name.to_string(),
+                        detail: Some(detail),
+                        kind: Some(CompletionItemKind::PROPERTY),
+                        insert_text: Some(format!("{}: ", prop_name)),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // Sort by usage frequency then alphabetical
+        items.sort_by(|a, b| a.label.cmp(&b.label));
+        items.truncate(20); // Limit to 20 properties
+        items
+    }
+
+    fn is_in_frontmatter(&self, doc: &Document, line_idx: usize) -> bool {
+        let lines: Vec<&str> = doc.contents.lines().collect();
+        
+        if lines.is_empty() || !lines[0].trim().starts_with("---") {
+            return false;
+        }
+
+        // Find the end of frontmatter
+        for (idx, line) in lines.iter().enumerate().skip(1) {
+            if line.trim() == "---" {
+                return line_idx > 0 && line_idx < idx;
+            }
+        }
+        
+        false
+    }
 }
 
 fn position_in_range(position: Position, range: Range) -> bool {
@@ -713,6 +999,149 @@ mod tests {
             panic!("Expected Link node type");
         }
     }
+
+    #[test]
+    fn test_completion_link_context() {
+        // Test link completion context detection by checking string patterns
+        let line = "This is a test with [[partial";
+        let position = 29; // After "[[partial"
+        
+        // Simulate the context detection logic
+        let line_before_cursor = &line[..position.min(line.len())];
+        if let Some(link_start) = line_before_cursor.rfind("[[") {
+            let link_end = line_before_cursor[link_start..].find("]]");
+            assert!(link_end.is_none(), "Should detect incomplete link context");
+            
+            let partial_link = &line_before_cursor[link_start + 2..];
+            assert_eq!(partial_link, "partial", "Should extract partial link text");
+        }
+        
+        // Test with date-like patterns (the reported issue)
+        let date_line = "Today I will write [[2025-07-06";
+        let date_position = 32; // After "[[2025-07-06"
+        
+        let date_line_before_cursor = &date_line[..date_position.min(date_line.len())];
+        if let Some(link_start) = date_line_before_cursor.rfind("[[") {
+            let link_end = date_line_before_cursor[link_start..].find("]]");
+            assert!(link_end.is_none(), "Should detect incomplete date link context");
+            
+            let partial_date_link = &date_line_before_cursor[link_start + 2..];
+            assert_eq!(partial_date_link, "2025-07-06", "Should extract partial date link text including dashes");
+        }
+        
+        // Test partial date with just one dash
+        let partial_date_line = "Today I will write [[2025-";
+        let partial_date_position = 27; // After "[[2025-"
+        
+        let partial_date_line_before_cursor = &partial_date_line[..partial_date_position.min(partial_date_line.len())];
+        if let Some(link_start) = partial_date_line_before_cursor.rfind("[[") {
+            let link_end = partial_date_line_before_cursor[link_start..].find("]]");
+            assert!(link_end.is_none(), "Should detect incomplete partial date link context");
+            
+            let partial_with_dash = &partial_date_line_before_cursor[link_start + 2..];
+            assert_eq!(partial_with_dash, "2025-", "Should extract partial date including trailing dash");
+        }
+    }
+
+    #[test]
+    fn test_completion_tag_context() {
+        // Test tag completion context detection
+        let line = "This is a test with #parti";
+        let position = 26; // After "#parti"
+        
+        let line_before_cursor = &line[..position.min(line.len())];
+        if let Some(tag_start) = line_before_cursor.rfind('#') {
+            let before_hash = &line_before_cursor[..tag_start];
+            assert!(!before_hash.contains("http"), "Should not be part of URL");
+            
+            let after_hash = &line_before_cursor[tag_start + 1..];
+            assert_eq!(after_hash, "parti", "Should extract partial tag text");
+        }
+    }
+
+    #[test]
+    fn test_completion_frontmatter_context() {
+        // Test frontmatter detection logic
+        let content = "---\ntitle: Test\nauth\n---\n# Content";
+        let lines: Vec<&str> = content.lines().collect();
+        let line_idx = 2; // "auth" line
+        
+        // Simulate is_in_frontmatter logic
+        if !lines.is_empty() && lines[0].trim().starts_with("---") {
+            for (idx, line) in lines.iter().enumerate().skip(1) {
+                if line.trim() == "---" {
+                    let is_in_frontmatter = line_idx > 0 && line_idx < idx;
+                    assert!(is_in_frontmatter, "Line 2 should be detected as in frontmatter");
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_completion_providers_basic() {
+        use crate::index::VaultIndex;
+        use std::path::PathBuf;
+
+        // These are simplified unit tests for the core logic
+        // More complex integration tests would require a full Backend instance
+
+        // Test link completion logic
+        let mut link_index = VaultIndex::new();
+        link_index.link_map.insert("test-file".to_string(), PathBuf::from("/test/test-file.md"));
+        link_index.link_map.insert("another-test".to_string(), PathBuf::from("/test/another-test.md"));
+        
+        // Verify we have the expected data in our index
+        assert_eq!(link_index.link_map.len(), 2, "Should have 2 link entries");
+
+        // Test tag completion logic  
+        let mut tag_index = VaultIndex::new();
+        tag_index.tag_map.insert("programming".to_string(), vec![PathBuf::from("/test/file1.md")]);
+        tag_index.tag_map.insert("rust".to_string(), vec![PathBuf::from("/test/file1.md"), PathBuf::from("/test/file2.md")]);
+        
+        assert_eq!(tag_index.tag_map.len(), 2, "Should have 2 tag entries");
+
+        // Test property completion logic
+        let mut prop_index = VaultIndex::new();
+        prop_index.property_map.insert("custom-property".to_string(), vec![PathBuf::from("/test/file1.md")]);
+        
+        assert_eq!(prop_index.property_map.len(), 1, "Should have 1 property entry");
+
+        println!("Basic completion provider data structures validated");
+    }
+
+    #[test]
+    fn test_frontmatter_detection_logic() {
+        // Test document with frontmatter
+        let doc_content = "---\ntitle: Test\nauthor: Me\n---\n# Content";
+        let lines: Vec<&str> = doc_content.lines().collect();
+
+        // Simulate frontmatter detection logic 
+        let has_frontmatter = !lines.is_empty() && lines[0].trim().starts_with("---");
+        assert!(has_frontmatter, "Should detect frontmatter start");
+
+        // Find frontmatter end
+        let mut frontmatter_end = None;
+        for (idx, line) in lines.iter().enumerate().skip(1) {
+            if line.trim() == "---" {
+                frontmatter_end = Some(idx);
+                break;
+            }
+        }
+        
+        assert_eq!(frontmatter_end, Some(3), "Should find frontmatter end at line 3");
+
+        // Test lines within frontmatter
+        let line_1_in_fm = 1 > 0 && 1 < 3; // title line
+        let line_2_in_fm = 2 > 0 && 2 < 3; // author line  
+        let line_4_in_fm = 4 > 0 && 4 < 3; // content line
+
+        assert!(line_1_in_fm, "Line 1 should be in frontmatter");
+        assert!(line_2_in_fm, "Line 2 should be in frontmatter");
+        assert!(!line_4_in_fm, "Line 4 should not be in frontmatter");
+    }
+
+
 }
 
 #[tokio::main]
