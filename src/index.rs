@@ -204,7 +204,7 @@ fn parse_frontmatter(frontmatter: &str) -> (Vec<String>, Vec<String>, HashMap<St
     (aliases, tags, properties)
 }
 
-fn extract_inline_tags(content: &str) -> Vec<String> {
+pub fn extract_inline_tags(content: &str) -> Vec<String> {
     use regex::Regex;
     // Match hashtags that are not part of URLs
     let tag_regex = Regex::new(r"(?:^|[^/])#([a-zA-Z][a-zA-Z0-9_/-]*)").unwrap();

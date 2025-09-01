@@ -1222,17 +1222,25 @@ impl Backend {
 
             // Read and parse the file to find exact tag positions
             if let Ok(content) = tokio::fs::read_to_string(file_path).await {
-                let doc = Document::from(content);
+                let doc = Document::from(content.clone());
 
-                // Find all tag nodes with this name
+                // Find all tag nodes with this name (inline tags)
                 for node in doc.nodes.values() {
                     if let NodeType::Tag(node_tag) = &node.node_type {
                         if node_tag.to_lowercase() == normalized_tag {
                             if let Some(location) = self.node_to_location(file_path, node) {
                                 locations.push(location);
-                                debug!("Found tag reference at line {}", node.range.start.line);
+                                debug!("Found inline tag reference at line {}", node.range.start.line);
                             }
                         }
+                    }
+                }
+
+                // Also check for frontmatter tags
+                if let Some(frontmatter_location) = self.find_frontmatter_tag_location(&content, &normalized_tag) {
+                    if let Some(location) = self.node_to_location(file_path, &frontmatter_location) {
+                        locations.push(location);
+                        debug!("Found frontmatter tag reference at line {}", frontmatter_location.range.start.line);
                     }
                 }
             } else {
@@ -1256,6 +1264,79 @@ impl Backend {
             uri,
             range: node.range,
         })
+    }
+
+    fn find_frontmatter_tag_location(&self, content: &str, tag_name: &str) -> Option<Node> {
+        // Check if file has frontmatter
+        if !content.starts_with("---") {
+            return None;
+        }
+
+        // Find the end of frontmatter
+        if let Some(end_pos) = content[3..].find("---") {
+            let _frontmatter_end_pos = 3 + end_pos; // Position of the closing --- in the full content
+
+            // Look for the tags section in the full content
+            let mut in_tags_section = false;
+            let mut tag_indent = 0;
+
+            for (line_idx, line) in content.lines().enumerate() {
+                // Skip lines before frontmatter starts (the opening ---)
+                if line_idx == 0 && line.trim() == "---" {
+                    continue;
+                }
+
+                // Stop if we've reached the end of frontmatter
+                if line.trim() == "---" && line_idx > 0 {
+                    break;
+                }
+
+                let trimmed = line.trim();
+
+                if trimmed == "tags:" || trimmed == "tag:" {
+                    in_tags_section = true;
+                    tag_indent = line.len() - line.trim_start().len(); // Get indentation level
+                    continue;
+                }
+
+                if in_tags_section {
+                    // Check if we're still in the tags section
+                    let current_indent = line.len() - line.trim_start().len();
+
+                    // If we encounter a line with same or less indentation that's not empty and not a list item, we're done with tags
+                    if current_indent <= tag_indent && !line.trim().is_empty() && !line.trim().starts_with('-') {
+                        break;
+                    }
+
+                    // Check for list item with our tag
+                    if line.trim().starts_with("- ") {
+                        let tag_value = line.trim()[2..].trim().trim_matches('"').trim_matches('\'');
+                        if tag_value == tag_name {
+                            // Found the tag! Create a node for it
+                            let char_start = line.find("- ").unwrap() + 2;
+                            let char_end = line.len();
+
+                            return Some(Node {
+                                node_type: NodeType::Tag(tag_name.to_string()),
+                                children: vec![],
+                                range: Range {
+                                    start: Position {
+                                        line: line_idx as u32,
+                                        character: char_start as u32,
+                                    },
+                                    end: Position {
+                                        line: line_idx as u32,
+                                        character: char_end as u32,
+                                    },
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -1533,7 +1614,7 @@ mod tests {
         use std::path::PathBuf;
 
         // Test the reverse link mapping functionality
-        let mut index = VaultIndex::new();
+        let index = VaultIndex::new();
 
         // Simulate files with links
         let file1_path = PathBuf::from("/test/file1.md");
@@ -1579,6 +1660,70 @@ mod tests {
         assert!(another_link_refs.contains(&file1_path));
 
         println!("Reverse link mapping test passed");
+    }
+
+    #[test]
+    fn test_tag_indexing() {
+        use crate::index::{VaultIndex, extract_inline_tags};
+        use std::path::PathBuf;
+
+        // Test tag indexing functionality
+        let index = VaultIndex::new();
+
+        // Simulate files with tags
+        let file1_path = PathBuf::from("/test/file1.md");
+        let file2_path = PathBuf::from("/test/file2.md");
+
+        // File 1 contains tags: inline-tag, programming, test
+        let file1_content = "This has #inline-tag and #programming tags. Also #test.";
+        let file1_tags = extract_inline_tags(file1_content);
+
+        // File 2 contains tags: test, another-tag
+        let file2_content = "This has #test and #another-tag.";
+        let file2_tags = extract_inline_tags(file2_content);
+
+        // Populate tag map
+        for tag in &file1_tags {
+            let normalized = tag.to_lowercase();
+            index.tag_map
+                .entry(normalized)
+                .or_insert_with(Vec::new)
+                .push(file1_path.clone());
+        }
+
+        for tag in &file2_tags {
+            let normalized = tag.to_lowercase();
+            index.tag_map
+                .entry(normalized)
+                .or_insert_with(Vec::new)
+                .push(file2_path.clone());
+        }
+
+        // Verify tag mapping
+        assert_eq!(index.tag_map.len(), 4, "Should have 4 unique tags");
+
+        // Check that "test" tag is in both files
+        let test_refs = index.tag_map.get("test").unwrap();
+        assert_eq!(test_refs.len(), 2, "test tag should be in 2 files");
+        assert!(test_refs.contains(&file1_path));
+        assert!(test_refs.contains(&file2_path));
+
+        // Check that "inline-tag" is only in file1
+        let inline_refs = index.tag_map.get("inline-tag").unwrap();
+        assert_eq!(inline_refs.len(), 1, "inline-tag should be in 1 file");
+        assert!(inline_refs.contains(&file1_path));
+
+        // Check that "programming" is only in file1
+        let prog_refs = index.tag_map.get("programming").unwrap();
+        assert_eq!(prog_refs.len(), 1, "programming tag should be in 1 file");
+        assert!(prog_refs.contains(&file1_path));
+
+        // Check that "another-tag" is only in file2
+        let another_refs = index.tag_map.get("another-tag").unwrap();
+        assert_eq!(another_refs.len(), 1, "another-tag should be in 1 file");
+        assert!(another_refs.contains(&file2_path));
+
+        println!("Tag indexing test passed");
     }
 
     #[test]
