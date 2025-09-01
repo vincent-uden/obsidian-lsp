@@ -38,6 +38,7 @@ jobs:
 
       - name: Get version
         id: version
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION=$(echo ${{ github.event.inputs.tag }} | sed 's/^v//')
@@ -62,17 +63,18 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          VERSION=${{ steps.version.outputs.version }}
+          VERSION="${{ steps.version.outputs.version }}"
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
-            7z a ../../../obsidian-lsp-$VERSION-${{ matrix.target }}.zip obsidian-lsp.exe
+            7z a "../../../obsidian-lsp-$VERSION-${{ matrix.target }}.zip" obsidian-lsp.exe
           else
-            tar czf ../../../obsidian-lsp-$VERSION-${{ matrix.target }}.tar.gz obsidian-lsp
+            tar czf "../../../obsidian-lsp-$VERSION-${{ matrix.target }}.tar.gz" obsidian-lsp
           fi
 
       - name: Upload binary to release
         uses: softprops/action-gh-release@v1
         if: matrix.target == 'x86_64-pc-windows-msvc'
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event.release.tag_name }}
           files: obsidian-lsp-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -81,6 +83,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         if: matrix.target != 'x86_64-pc-windows-msvc'
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.event.release.tag_name }}
           files: obsidian-lsp-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
